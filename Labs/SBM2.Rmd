@@ -1,0 +1,480 @@
+---
+title: "Basic SBM"
+output: html_document
+date: "2023-09-27"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_knit$set(root.dir = "..")
+```
+
+```{r echo = FALSE, message = FALSE}
+
+## Packages
+
+# One package will require install from github
+if("mcclust.ext" %in% rownames(installed.packages()) == FALSE) 
+  {devtools::install_github('sarawade/mcclust.ext')}
+library(mcclust.ext)
+
+# The rest are straightforward
+library(nimble)
+library(nimbleHMC)
+library(pheatmap)
+library(RColorBrewer)
+library(tidyverse)
+library(gridExtra)
+library(here)
+library(bayesplot)
+library(truncnorm)
+library(latex2exp)
+
+## Set directories
+data_path <- 'Data/'
+
+```
+
+TO DO
+
+-   ~~Tuning alpha, K, tau~~
+
+-   ~~Nimble model~~
+
+-   ~~Check recovery of alpha~~
+
+-   ~~Add logL and check its mixing~~
+
+-   ~~Make nicer probability recovery plot~~
+
+-   ~~MCMC intervals for: alpha, maybe lambda?~~
+
+-   MCMC diagnostics - pROC etc - Run longer and with bigger network to
+    get better recovery
+
+-   Trade application
+
+# PART 1: SIMULATE FROM AND FIT A DEGREE CORRECTED STOCHASTIC BLOCK MODEL
+
+## 1a. Simulate from a degree-corrected stochastic block model
+
+$\mbox{logit}(\pi_{ij})=\mu_{Z_i,Z_j}+\alpha_i + \alpha_j$
+
+We assume independent Dirichlet-multinomial priors on group membership
+as before:
+
+$$\pi(Z \mid \lambda ) = \prod_{p=1}^n Z_{p.}^T \lambda \\
+    \lambda \sim \text{Dirichlet}(\alpha 1_K) \\$$
+
+But now, using a logistic link function (and Polya-gamma data
+augmentation) facilitates the use of normal priors for the logit$^{-1}$
+block connection probabilities as well as the degree correction
+probabilities. CLARIFY THIS
+
+$$\mu_{hl} \sim  N(m_{1(h=l)},v_{1(h=l)}) \\
+\alpha_i \sim N(0,\tau)\\
+\tau^{-1/2}\sim N_+(0,1)\\$$
+
+Now we simulate from the model. Note that the (induced) prior on $\tau$
+is weakly informative, and so drawing from that prior has the potential
+to generate extreme heterogeneity within communities. To preserve the
+block structure for this example, we could simply set $tau$ to induce a
+moderate level of heterogeneity, rather than drawing it from its prior.
+
+```{r}
+set.seed(100)
+
+# Setup data structure
+V <- 25
+K <- 5
+
+# Set hyperparameters
+sd.tau <- 1 # degree correction sd: determines amount of heterogeneity
+m0 <- log(0.05/(1-0.05)) # very low between block connectivity
+v0 <- 1
+m1 <- log(0.95/(1-0.95)) # very high within block connectivity
+v1 <- 1
+
+# Simulate group membership
+lambda <- rdirch(n=1, alpha = rep(5/K, K)) # TUNING COME BACK TO THIS
+z <- sample(1:K, size = V, prob = lambda, replace = TRUE)
+z.mat <- matrix(0, nrow = V, ncol = K)
+for(i in 1:V){
+  z.mat[i,z[i]] <- 1
+}
+
+# Simulate within and between community connection probabilities
+mu <- matrix(NA, nrow = K, ncol = K) # matrix of group-edge probabilities
+mu[upper.tri(mu, diag = FALSE)] <- rnorm(n = K*(K- 1)/2, mean = m0, sd = sqrt(v0)) # Between communities
+mu[lower.tri(mu, diag = FALSE)] <- t(mu)[lower.tri(mu, diag = FALSE)]
+diag(mu) <- rnorm(K, mean = m1, sd = sqrt(v1)) # Within community
+
+# Simulate random effects variance and random effects (degree correction terms)
+tau.star <- rtruncnorm(1, a = 0, b = Inf, mean = 0, sd = sd.tau)
+tau <- tau.star^(-2) # Reasonable RE variance, we'll keep it
+alpha <- rnorm(V, mean = 0, sd = tau)
+alpha.mat <- outer(alpha, alpha, FUN = "+")
+diag(alpha.mat) <- NA # no self edges
+
+# Compute connection score for each pair of nodes
+s.mat <- z.mat %*% mu %*% t(z.mat) + alpha.mat
+
+# Get probabilities
+pi.mat <- 1/(1 + exp(-s.mat))
+
+# Simulate data
+Y <- matrix(NA, nrow = V, ncol = V)
+Y[upper.tri(Y)] <- rbinom(V*(V - 1)/2, 1, pi.mat[upper.tri(pi.mat)])
+Y[lower.tri(Y)] <- t(Y)[lower.tri(Y)]
+rownames(Y) <- colnames(Y) <- paste0("Node ", 1:V)
+
+# Might need to add diag to Y to avoid errors in Nimble
+diag(Y) <- 0
+
+# Plot the data
+sel <- order(z)
+z_sorted <- z[sel]
+Y_sorted <- Y[sel, sel]
+
+pheatmap(Y_sorted, cluster_rows = F, cluster_cols = F,
+         color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30), 
+         main = "Observed Adjacency Matrix", 
+         fontsize = 8, show_rownames = T, show_colnames = T, 
+         legend = F)
+
+```
+
+------------------------------------------------------------------------
+
+EXERCISE
+
+1.  Rerun the simulation code above, starting with a new seed each time.
+    Comment on the impact of $\tau$ on network structure.
+
+------------------------------------------------------------------------
+
+## 1b. Fitting a degree-corrected stochastic block model with NIMBLE
+
+Now we define and fit the model with Nimble.
+
+------------------------------------------------------------------------
+
+EXERCISE
+
+2.  Partial code defining the Nimble DC-SBM is provided below. Complete
+    it and add the additional an additional computed quantity for the
+    log likelihood.
+
+------------------------------------------------------------------------
+
+```{r, cache = TRUE, echo = FALSE}
+# Define model with BUGS code
+DCsbmCode <- nimbleCode({
+  
+  # lambda - latent group assignment probabilties (vector of length K)
+  lambda[1:K] ~ ddirch(alpha.dirch[]) 
+  
+  # Z - latent group indicator (binary vector of length K, summing to 1)
+  for(i in 1:V){
+    Z[i] ~ dcat(prob = lambda[])
+  }
+
+  # Mu - symmetric matrix of within and between group edge probabilities
+  for (i in 1:K){
+    Mu[i,i] ~ dnorm(mean = m1, sd = sqrt(v1)) # Within block connections
+    for (j in 1:(i-1)){ 
+      Mu[i,j] ~ dnorm(mean = m0, sd = sqrt(v0)) # Between block connections 
+      Mu[j,i] <- Mu[i,j] # symmetric matrix
+    }
+  }
+  
+  # Tau: RE variance
+  tau.star ~ T(dnorm(mean = 0, sd = sd.tau), 0, ) # note declaration of trunc density
+  tau <- tau.star^(-2) 
+  for(v in 1:V){
+    Alpha[v] ~ dnorm(mean = 0, sd = tau)    
+  }
+
+
+  # Pi - node to node edge probabilities (based on group membership)
+  for (i in 2:V){
+    for (j in 1:(i-1)){ # Self-edges not allowed
+      S[i,j] <- myCalculation(Mu[,], Z[i], Z[j]) + Alpha[i] + Alpha[j]
+      S[j,i] <- S[i,j]
+      Pi[i,j] <- phi(S[i,j]) # Gaussian CDF (inverse probit)
+      Pi[j,i] <- Pi[i,j]
+      Y[i,j] ~ dbin(size = 1, prob = Pi[i,j])
+    }
+  }
+  
+  # Add zero diagonal to avoid NA in post samples error (we don't actually use these)
+  for(i in 1:V){ 
+    S[i,i] <- 0
+    Pi[i,i] <- 0
+  }
+  
+  # Compute logL
+  for (i in 2:V){
+    for (j in 1:(i-1)){ # Self-edges not allowed
+        mat.logL[i,j] <- log((Pi[i,j]^Y[i,j])*((1 - Pi[i,j])^(1-Y[i,j])))
+        #mat.logL[j,i] <- 0
+    }}
+  
+  logL <- sum(mat.logL[1:V, 1:V])/2 # diag is zero so this works
+
+})
+
+## User-defined functions: written in NIMBLE
+myCalculation <- nimbleFunction(
+  run = function(grid = double(2), index1 = double(0), index2 = double(0)) {  
+    return(grid[index1, index2])
+    returnType(double(0))
+  })
+
+# Define the constants
+DCsbmConsts <- list(V = V, K= K,
+                  m0 = m0, v0 = v0, m1 = m1, v1 = v1,
+                  sd.tau = sd.tau, 
+                  alpha.dirch =  rep(1/K, K))
+
+# Define the data
+DCsbmData <- list(Y = Y)
+
+# Set initialization parameters
+DCsbmInits <- list(lambda = rep(1/K, K), # block assignment probs
+                 Mu = matrix(probit(mean(Y)), K, K), # block connection probs
+                 tau.star = 1, tau = 1, # RE variance parameters
+                 Alpha = rep(probit(mean(Y)), V), # random effects
+                 Pi = matrix(mean(Y), V, V), # pairwise edge probs
+                 S = matrix(probit(mean(Y)), V, V), # extra var for debugging
+                 Z = sample(1:K, size = V, replace = TRUE), 
+                 mat.logL = matrix(0,V,V))
+
+DCsbmDims <- list(lambda = c(K), theta = c(K, K), Pi = c(V, V), S = c(V,V), mat.logL = c(V,V))
+
+# Create NIMBLE model
+DCsbm <- nimbleModel(code = DCsbmCode, name = "DCsbm", constants = DCsbmConsts, data = DCsbmData, 
+                   dimensions = DCsbmDims, inits = DCsbmInits)
+# Check conjugacy
+configureMCMC(DCsbm, print = TRUE)
+
+# Easiest way to run: 
+niter <- 10000
+nchains <- 2
+mcmc.out <- nimbleMCMC(code = DCsbmCode, constants = DCsbmConsts,
+                       data = DCsbmData, inits = DCsbmInits,
+                       nchains = nchains, niter = niter,
+                       summary = TRUE, WAIC = TRUE,
+                       monitors = c('lambda', 'Pi', 'Z', 'Mu', 'Alpha', 'tau', 'logL'))
+```
+
+## 1c. MCMC Diagnostics
+
+```{r, echo = FALSE}
+# Have a look at the results
+head(mcmc.out$summary)
+
+# Not really useful for a single model, but: 
+mcmc.out$WAIC
+
+# Extract samples: list with items corresponding to chains
+DCsbm.samples <- mcmc.out$samples
+
+# Extract all samples and bind together
+samples <- do.call(rbind, mcmc.out$samples)
+pi.samples <- samples[, grepl("Pi", colnames(samples))]
+alpha.samples <- samples[, grepl("Alpha", colnames(samples))]
+
+# Log likelihood
+mcmc_trace(DCsbm.samples, regex_pars = c("logL")) 
+
+# Block connection probabilities
+mcmc_trace(DCsbm.samples, regex_pars = c("Mu")) 
+
+# Block assignment probabilities
+mcmc_trace(DCsbm.samples, regex_pars = c("lambda")) 
+
+
+# Log likelihood
+mcmc_trace(DCsbm.samples, regex_pars = c("logL")) 
+```
+
+# 1d. Evaluate parameter recovery and accuracy
+
+First, to get an overview of our model's performance, we take advantage
+of the fact that we have simulated data and evaluate the recovery of
+latent edge probabilities across all pairs of nodes.
+
+```{r}
+# Extract posterior connection probabilities
+p.post <- matrix(data = colMeans(pi.samples), byrow = FALSE, nrow = V, ncol = V)
+diag(p.post) <- NA
+
+# Plotting setup
+samegroup.mat <- z.mat %*% t(z.mat) # define common group indicator
+data.frame(pred = p.post[upper.tri(p.post)], true = pi.mat[upper.tri(pi.mat)], 
+                    samegroup = as.factor(samegroup.mat[upper.tri(samegroup.mat)])) %>% 
+ggplot(aes(x = pred, y = true, color = samegroup)) + 
+                                    geom_point(aes(alpha = I(0.3))) + # aes(alpha = I(0.1))
+                                    geom_abline(intercept = 0, slope = 1, color = "gray") + 
+                                    xlab(parse(text = TeX('$\\hat{\\pi}_{ij}$'))) + 
+                                    ylab(parse(text = TeX('$\\pi_{ij}$'))) + 
+                                    scale_color_viridis_d(name = "", labels = c("Different clusters", "Same cluster")) + 
+                                    #ggtitle(plot.name) +
+                                    theme_minimal() + 
+                                    theme(text = element_text(family = "serif", size = 14))
+
+```
+
+```{r}
+# Alpha recovery
+alpha.samples <- samples[, grepl("Alpha", colnames(samples))]
+alpha.post <- colMeans(alpha.samples)
+plot(alpha.post, alpha)
+mcmc_recover_intervals(alpha.samples, true = alpha, prob = 0.90,prob_outer = 0.95)
+
+# Mu recovery
+mu.samples <- samples[, grepl("Mu", colnames(samples))]
+mu.post <- colMeans(mu.samples)
+plot(sort(mu.post), sort(mu)) # Note that we only need upper/lower tri, but points overlap
+
+```
+
+------------------------------------------------------------------------
+
+EXERCISE
+
+------------------------------------------------------------------------
+
+3.  Vary the value of $\tau$ to increase heterogeneity. How does this
+    impact recovery of the random effect parameters $\alpha$ and the
+    between block connection parameters $\mu$.
+
+# PART 2: TRADE APPLICATION
+
+Now let's explore some real data
+
+```{r, cache = TRUE}
+A <- read.csv(here::here(paste0(data_path, "2021Trade/A_subset.csv")))
+features <- read.csv(here::here(paste0(data_path, "2021Trade/Features_subset.csv")))
+
+# Define the constants
+V <- nrow(A)
+K <- 5
+
+# Set hyperparameters
+sd.tau <- 1 # degree correction sd: determines amount of heterogeneity
+meanA <- mean(as.matrix(A))
+m0 <- log(0.25/(1-0.25)) # very low between block connectivity
+v0 <- 1
+m1 <- log(0.75/(1-0.75)) # very high within block connectivity
+v1 <- 1
+
+
+# Define the constants
+DCsbmConsts <- list(V = V, K= K,
+                  m0 = m0, v0 = v0, m1 = m1, v1 = v1,
+                  sd.tau = sd.tau, 
+                  alpha.dirch =  rep(1/K, K))
+
+# Define the data
+DCsbmData <- list(Y = A)
+
+# Set initialization parameters
+DCsbmInits <- list(lambda = rep(1/K, K), # block assignment probs
+                 Mu = matrix(probit(meanA), K, K), # block connection probs
+                 tau.star = 1, tau = 1, # RE variance parameters
+                 Alpha = rep(probit(meanA), V), # random effects
+                 Pi = matrix(meanA, V, V), # pairwise edge probs
+                 S = matrix(probit(meanA), V, V), # extra var for debugging
+                 Z = sample(1:K, size = V, replace = TRUE), 
+                 mat.logL = matrix(0,V,V))
+
+DCsbmDims <- list(lambda = c(K), theta = c(K, K), Pi = c(V, V), S = c(V,V), mat.logL = c(V,V))
+
+# Create NIMBLE model
+DCsbm <- nimbleModel(code = DCsbmCode, name = "DCsbm", constants = DCsbmConsts, data = DCsbmData, 
+                   dimensions = DCsbmDims, inits = DCsbmInits)
+# Check conjugacy
+configureMCMC(DCsbm, print = TRUE)
+
+# Easiest way to run: 
+niter <- 10000
+nchains <- 2
+mcmc.out <- nimbleMCMC(code = DCsbmCode, constants = DCsbmConsts,
+                       data = DCsbmData, inits = DCsbmInits,
+                       nchains = nchains, niter = niter,
+                       summary = TRUE, WAIC = TRUE,
+                       monitors = c('lambda', 'Pi', 'Z', 'Mu', 'Alpha', 'tau', 'logL'))
+```
+
+First, do some basic MCMC diagnostics.
+
+```{r}
+
+# Not really useful for a single model, but: 
+mcmc.out$WAIC
+
+## MCMC diagnostics: unclear how useful because of label switching
+sbm.samples <- mcmc.out$samples
+
+# Block connection probabilities: RW sampler getting stuck at init, always rejecting, init too far from prior?
+mcmc_trace(sbm.samples, regex_pars = c("theta")) 
+
+# Block assignment probabilities
+mcmc_trace(sbm.samples, regex_pars = c("lambda")) 
+```
+
+```{r}
+
+# Extract mcmc  samples
+samples <- do.call(rbind, mcmc.out$samples) # bind together the samples from all chains
+z.samples <- samples[, grepl("Z", colnames(samples))]
+
+# Compute posterior similarity matrix
+z.psm <- comp.psm(z.samples) 
+
+# Find a representative partition of posterior by minimizing VI
+z.vi <- minVI(z.psm)
+z.cl.post <- z.vi$cl
+
+# Take eigen decomp
+eig.A <- eigen(A)
+
+# Plot posterior clustering
+evec.A <- eig.A$vectors
+
+p1 <- data.frame(V1 = evec.A[,1], V2 = evec.A[,2], Post.Z = as.factor(z.cl.post)) %>% 
+  ggplot(aes(x = V1, y = V2, color = Post.Z), alpha = 0.25) + 
+  geom_point() + 
+  labs(title = "Posterior Clustering") + 
+  theme_minimal() + 
+  theme(legend.position = "none") + 
+  scale_color_viridis_d()
+p2 <- data.frame(V1 = evec.A[,1], V2 = evec.A[,2], Region = as.factor(features$region), 
+                 size = rowSums(A), code = features$code) %>% 
+  ggplot(aes(x = V1, y = V2, color = Region, size = size, label = code), alpha = 0.25) + 
+  #geom_jitter() + 
+  geom_text(check_overlap = TRUE, show.legend = FALSE) + 
+  theme_minimal() + 
+  guides(size = "none") + 
+  labs(title = "Data") + 
+  scale_color_viridis_d()
+grid.arrange(p2,p1, nrow = 1)
+
+
+```
+
+Data is plotted as the first two eigenvectors. Left: size is total
+number of edges, color is region. Right: posterior clusters.
+
+We can see that with our strongly assortative prior, clusters are based
+largely on the number of links. What happens if we weaken the
+assortative assumption? Compare number of clusters, WAIC, etc.
+
+# ASSIGNMENT
+
+Fit an SBM to your data.

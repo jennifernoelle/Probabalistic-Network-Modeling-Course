@@ -1,0 +1,715 @@
+---
+title: "Network Logistic Regression Lab"
+output: html_document
+date: "2023-10-06"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# TO DO:
+
+-   Remove probit regression, put in separate lab
+-   Add more to WAIC definition: https://bookdown.org/ajkurz/Statistical_Rethinking_recoded/overfitting-regularization-and-information-criteria.html
+-   Add tutorial on saving plots, models, etc and readaing 
+-   ~~Add questions~~
+-   ~~Add text about ppc's~~
+-   ~~Try conjugacy~~
+-   ~~Fix conjugate sampler~~
+-   ~~Turn RE into separate question~~
+-   ~~Add more MCMC diagnostics and text~~
+-   If time: change variable names for MCMC diagnostics
+-   ~~PPC's~~
+
+# Housekeeping
+
+
+```{r, echo = FALSE, message = FALSE}
+## Set directories
+data_path <- 'Data/'
+save_path <- 'Data/'
+
+# Load packages
+library(tidyverse)
+library(here)
+library(igraph)
+library(ggraph)
+library(RColorBrewer)
+library(pheatmap)
+library(nimble)
+library(nimbleHMC)
+library(bayesplot)
+library(pROC)
+library(caret)
+
+```
+
+
+For this example, we'll be continuing with the OECD 2021 trade data. We
+begin by reading the data and extracting key data structures to use
+later on. 
+
+```{r}
+
+# Read the data 
+A <- read.csv(here::here(paste0(data_path, "2021Trade/A_subset.csv")))
+features <- read.csv(here::here(paste0(data_path, "2021Trade/Features_subset.csv")))
+
+# Extract useful dimensions
+nC <- nrow(A)
+
+# Do we want to save any output?
+save_files <- TRUE
+
+```
+
+
+# Introduction to NIMBLE using R
+
+Instructions and a basic tutorial for installing the package `nimble`
+are provided in Lab 0: Review R, and the full user manual is available
+[here](https://r-nimble.org/manuals/NimbleUserManual.pdf). We'll go
+through a brief intro here.
+
+NIMBLE is a powerful system for fitting statistical models in
+$\texttt{R}$. The NIMBLE algorithm library includes slice, adaptive
+random walk, adaptive block random walk, elliptical slice, Gibbs
+samplers, and many more. A predefined list of conjugacy relationships
+which Nimble detects is available
+[here](https://github.com/nimble-dev/nimble/blob/devel/packages/nimble/R/MCMC_conjugacy.R).
+
+More information on the NIMBLE samplers is available [here](https://rdrr.io/cran/nimble/man/samplers.html).
+
+A NIMBLE model can be thought of as a directed acyclic graph or DAG with
+deterministic relations indicated by `<-` and stochastic relationships
+indicated by a `~`. Visualizing the DAG for your model is a good way to
+ensure that your model is properly declared. Additionally, NIMBLE is a
+declarative language and the order of lines in a NIMBLE model does not
+matter.
+
+## NIMBLE workflow
+
+The basic NIMBLE workflow consists of the following steps:
+
+1.  Define a model consisting of likelihood and priors (BUGS)
+
+2.  Define your data, initial parameter values, and indicate the
+    parameters which you'll be doing inference on (R)
+
+3.  Configure the MCMC by specifying the number of chains, and the
+    number of burn-in and post-burn-in iterations (R code)
+
+4.  Compile and run the MCMC (C++)
+
+5.  Extract your results, perform MCMC diagnostics, and perform
+    inference on parameters of interest (R)
+
+## NIMBLE tips
+
+Beware of the following quirks:
+
+-   NIMBLE does not allow multivariate nodes to be used without square
+    brackets
+
+    -   Vector `x`: use `mean(x[ ])`
+
+    -   Matrix `x`: use `mean(x[ , ])`
+
+-   NIMBLE *does not permit stochastic indexing*: any variables used for
+    indexing must be provided as a constant, be a looping index, or
+    something deterministically derived from these (i.e., no indexing by
+    latent variables or indices that are not constant). If you need to
+    index on a latent variable, create a user-provided function to call
+    within the model
+
+-   *Multivariate distributions do not take expressions as arguments*:
+    all arguments should be given a deterministic definition prior to
+    the distribution call
+
+-   *Initialize all parameters* to be safe: failing to do so can cause
+    slow convergence or MCMC failure. Tips on initializing your MCMC are
+    provided in Chapter 7.4 of the NIMBLE user manual.
+
+-   *Provide dimensions, particularly for multivariate arrays* using the
+    `dimensions` argument to the function `nimbleModel` can help
+    identify and prevent dimension-related errors
+    
+-   *Note on symmetric matrices*: we are only intrested in the upper (or lower)
+    triangle of our adjacency or probabiilty matrices, and so it is of no concern
+    to have NA's or nonsensical 0's in the unused portions. However, this can cause
+    problems in NIMBLE for monitored parameters, and so NIMBLE is happier if you 
+    assign values to all components of stored matrices. 
+
+# Network logistic regression using NIMBLE
+
+To create our model, the first step is to define the likelihood and prior using BUGS code. 
+We will begin with the simple network logistic regression defined in lecture where edges are 
+defined as conditionally independent probabilities given by: 
+$$\text{logit} ((p(y_{ij}= 1)) = \text{logit} (\pi_{ij}) = \beta_0 + \beta_1 x_{ij},$$ where our edge covariate is an
+indicator that the two countries are in the same region, $x_{ij} = 1(R_i = R_j)$.
+
+## Define and run a NIMBLE model 
+### Define the model 
+```{r, cache = TRUE}
+# Define the model 
+glmCode <- nimbleCode({
+  # Priors
+  beta0 ~ dnorm(0, sd = 1) # some use sd = 10000!
+  beta1 ~ dnorm(0, sd = 1)
+  
+  # Likelihood
+  for (i in 2:N) { 
+    for (j in 1:(i-1)){
+      logit(p[i,j]) <- beta0 + beta1 * x[i,j] 
+      p[j,i] <- p[i,j]
+      y[i,j] ~ dbin(size = 1, prob = p[i,j])
+    }
+  }
+  
+  for(i in 1:nC){ # clunky code to avoid NA in p matrix
+    p[i,i] <- 0
+  }
+  
+})
+```
+Note that in the code above, we create a probability matrix. This isn't strictly 
+necessary, but it will make interpreting our model results more straightforward, 
+particularly for more complex models. 
+
+### Provide data, constants, initial values
+Now we provide the data, constants, and initial values to perform the MCMC. 
+
+```{r}
+# Define the model constants
+glmConsts <- list(N = nC)
+
+# Define the model data
+reg <- as.factor(features$region) 
+glmData <- list(
+  y = A,
+  x = outer(reg,reg, FUN = "==")*1 # x_ij = 1(region_i == region_j)
+)
+
+# Define the initial values
+glmInits <- list(beta0 = 0, beta1 = 0, p = matrix(0, nC, nC))
+
+# Define the dimensions
+glmDims <- list(p = c(nC, nC))
+```
+### Create a NIMBLE model object and check conjugacy
+Next, we process our BUGS code, constants, data, and initial values into a NIMBLE model. 
+
+```{r}
+# Create the Nimble model object
+glmModel <- nimbleModel(code = glmCode, constants = glmConsts, data = glmData, 
+                         inits = glmInits)
+
+```
+
+We can also configure the MCMC and check conjugacy; for now we're leaving the default 
+configuration as is, but you can pass additional arguments to configureMCMC if desired.
+At this point, we can also look at the DAG. For our model, there are too many nodes 
+to effectively visualize, but you can always subset your data and run `glmModel$plotGraph()`
+to make sure the DAG is as expected. 
+
+```{r}
+# Check conjugacy
+configureMCMC(glmModel, print = TRUE)
+```
+The above show that NIMBLE has not detected conjugacy and so the default
+sampler is an adaptive Random Walk Metropolis-Hastings sampler; this sampler
+uses the adaptation scheme of Shaby and Wells (2011). 
+
+
+### Fit the Model 
+The fastest way to fit our model is using the one-line MCMC invocation `nimbleMCMC`.
+```{r, cache = TRUE, message = FALSE}
+# MCMC invocation
+set.seed(1234)
+niter <- 2000
+nchains <- 2
+mcmc.out <- nimbleMCMC(code = glmCode, constants = glmConsts,
+                       data = glmData, inits = glmInits,
+                       nchains = nchains, niter = niter,
+                       summary = TRUE, WAIC = TRUE,
+                       monitors = c('beta0', 'beta1', 'p'))
+
+```
+
+## MCMC Diagnostics
+
+
+MCMC diagnostics are tools for determining if the MCMC samples provide and accurate
+approximation of our target posterior distribution, i.e. whether the chains have 
+converged. For a quick primer on visual MCMC diagnostics with the package `bayesplot`, visit
+the tutorial [here](https://mc-stan.org/bayesplot/articles/visual-mcmc-diagnostics.html).
+
+### Prior predictive checks
+Before we dive into our MCMC samples, we perform a prior predictive check. 
+In order to determine whether a prior is reasonable, we can generate data from the 
+prior and compare it to our observed data. 
+
+We simulate from the prior in the code below. Note that
+we are NOT using the data in the adjacency matrix $A$ to compute our prior predictive distribution, 
+we are using the data structure, i.e. the extent of regional overlap, stored in the matrix $X$. 
+
+In the same manner, we can use our posterior samples to perform postterior predictive checks. 
+
+
+
+```{r}
+# Vectorize our data: we'll compare this to our prior predictive samples
+obsA <-  A[upper.tri(A)]
+
+# Set up for the prior predictive
+n.samples <- 100
+x <- outer(reg,reg, FUN = "==")*1
+p.pp <- y.pp <- array(data = NA, dim = c(nC, nC, n.samples))
+
+# Simulate from the prior
+for(r in 1:n.samples){
+  # Priors
+  beta0 <- rnorm(1, 0, sd = 1) # some use sd = 10000!
+  beta1 <- rnorm(1, 0, sd = 1)
+  
+  # Model
+  for (i in 2:nC) { 
+    for (j in 1:(i-1)){
+      p.pp[i,j,r] <- p.pp[j,i,r] <- ilogit(beta0 + beta1 * x[i,j] )
+      y.pp[i,j,r] <- rbinom(n = 1, size = 1, prob = p.pp[i,j, r])
+    }
+  }
+  
+}
+
+p.psamples <- t(apply(p.pp, 3, function(x) x[lower.tri(x)]))
+y.psamples <- t(apply(y.pp, 3, function(x) x[lower.tri(x)]))
+
+pp_check(obsA, y.psamples[1:50, ], ppc_dens_overlay)
+pp_check(obsA, y.psamples[1:8, ], ppc_hist)
+
+```
+
+Which of the two plots above makes more sense for our data? 
+Does this look like a reasonable model for our data? 
+
+If the prior seems satisfactory based on the analysis above, we can move onto analyzing our posterior samples. 
+First, we do some light processing to get our samples into a more convenient format
+
+```{r}
+
+# Extract samples 
+samples <- mcmc.out$samples # as list of chains
+all.samples <- do.call(rbind, mcmc.out$samples) # as matrix
+
+# Extract posterior samples of the probability matrix
+p.samples <- all.samples[, grepl("p", colnames(all.samples))]
+p.post <- matrix(data = colMeans(p.samples), byrow = FALSE, nrow = nC, ncol = nC)
+
+```
+
+### Posterior Summaries
+A nice way to summarize the posterior samples and credible intervals is with the 
+`mcmc_intervals` function: 
+
+```{r}
+mcmc_intervals(all.samples, regex_pars = c("beta"))
+head(mcmc.out$summary[[1]])
+```
+***
+### Exercise
+Interpret the regression coefficients above, the credible intervals. Modify the credible intervals
+to visualize 90 and 95\% of the posterior probability mass. 
+***
+
+*Answer:* 
+
+```{r}
+
+# Baseline connection prob
+b0.hat <- mean(all.samples[, grepl("beta0", colnames(all.samples))])
+exp(b0.hat)/( 1 + exp(b0.hat)) # Baseline edge probabilty
+
+# Connection prob for same region
+b1.hat <- mean(all.samples[, grepl("beta1", colnames(all.samples))])
+exp(b0.hat + b1.hat)/(1 + exp(b0.hat + b1.hat))
+
+```
+### Trace plots
+
+One very useful diagnostic plot is the trace plot, a time series plot of the posterior samples from our Markov Chains, this allows us to evaluate the 
+evolution of the parameter over time (i.e., ``mixing''). In general, a good trace plot should show
+random scatter around a mean; if in contrast we see snaking or local trending, it suggests that
+our chains have not mixed well and may not yet have converged to the stationary distribution. 
+Mixing looks satisfactory in the plots below. 
+
+```{r}
+mcmc_trace(samples, regex_pars = c("beta"))
+```
+
+### Pairs plots
+
+The function `mcmc_pairs` allows us to look at multiple parameters at once, and is
+useful for identifying collinearity between variables. Note that the related function
+`mcmc_parcoord` works better with a high number of parameters. 
+
+```{r}
+mcmc_pairs(samples, regex_pars = c("beta"))
+```
+
+The narrow bivariate scatter for $(\beta_0, \beta_1)$ indicates some collinearity. Is this expected?
+
+### ACF
+ACF plots show the autocorrelation between successive iterations of a given parameter. 
+In the ideal case, our MCMC samples would be independent draws from the posterior, and
+so we would like to see ACF dropping quickly to 0 as the lag increases. 
+
+We have strong autocorrelation for our paramters (recall, sampled via RW), however
+they do eventually fall off. 
+
+```{r}
+mcmc_acf(samples, regex_pars = c("beta"))
+```
+## Accuracy
+
+The ROC curve (receiver operating characteristic curve) shows the performance of our
+posterior samples as predictors at varying thresholds. Area under the ROC curve (AUC)
+provides a summary of performance across all classification thresholds. How does our
+very simple model perform?
+
+```{r}
+df <- data.frame(pred = p.post[upper.tri(p.post)], data = obsA)
+plot.roc(df$data ~ df$pred, percent = TRUE, print.auc = TRUE, main = "ROC Curve - Baseline GLM")
+
+```
+
+One final metric for assessing model fit is the *WAIC* or the Widely Applicable 
+Information Cirterion/Watanabe-Akaike Information Criterion(Watanabe, 2010). The WAIC
+provides and estimator of prediction error for comparing a set of statistical 
+models fit to the same data; lower WAIC scores indicate better fit (think of it 
+as the information lost the model relative to the full data). A nice explanation
+of the various predictive information criteria for Bayesian models is [here](http://www.stat.columbia.edu/~gelman/research/published/waic_understand3.pdf).
+
+NIMBLE computes the WAIC for fitted models, the default option being the conditional WAIC. 
+Note that NIMBLE's computation does depend on which nodes are treated as parameters, 
+so this should be consistent across models being compared. 
+See Chapter 7.8 of the NIMBLE manual for details. 
+
+We extract the WAIC below. While it is not useful in isolation, we will use it for
+comparing this first model to subsequent models. 
+
+```{r}
+mcmc.out$WAIC
+```
+
+# Conjugate sampler
+
+The above posterior samples were obtained via Random Walk samplers. However, 
+it is relatively straight-forward to construct a Gibbs sampler for logistic regression
+by introducing a Polya-Gamma latent variable following Polson et. al. (2012). 
+Unfortunatley, the Polya-Gamma distribution is not currently included in NIMBLE's 
+library. 
+
+Alternatively, we can switch our link from the logistic function to the probit function:
+
+$p(y_{ij}=1) = \pi_{ij} = \Phi(\beta_0 + \beta_1 x)$, where $\Phi$ is the cumulative
+distribution function of the standard normal distribution. 
+
+We can create conjugacy under this model by introducing a latent normal random variable
+$z$ such that $y_{ij} = 1(z_{ij} > 0)$. This is known as probit data augmentation, 
+developed by Albert and Chib (1993). 
+
+```{r}
+
+# Define the model
+glmCode2 <- nimbleCode({
+  # Priors
+  beta0 ~ dnorm(0, sd = 1)
+  beta1 ~ dnorm(0, sd = 1)
+  
+  # Likelihood
+  for (i in 2:N) { 
+    for (j in 1:(i-1)){
+      y[i,j] ~ dinterval(z[i,j], 0)
+      z[i,j] ~ dnorm(beta0 + beta1*x[i,j], 1)
+    }
+  }
+})
+```
+
+***
+### Exercise
+Add a computed quantity for the probability matrix above. Then, define the data, 
+initial values, and dimensions for the data augmented probit model. 
+What is a reasonable initialization for $z$? 
+Does the configured model show all of the expected conjugacies?
+***
+
+*Answer*
+
+```{r, cache = TRUE, message = FALSE}
+# Define the model: alternate version
+glmCode2 <- nimbleCode({
+  # Priors
+  beta0 ~ dnorm(0, sd = 1)
+  beta1 ~ dnorm(0, sd = 1)
+  
+  # Likelihood
+  for (i in 2:N) { 
+    for (j in 1:(i-1)){
+      y[i,j] ~ dinterval(z[i,j], 0)
+      z[i,j] ~ dnorm(beta0 + beta1*x[i,j], 1)
+      
+      # Computed quantities
+      p[i,j] <- phi(beta0 + beta1*x[i,j])
+      p[j,i] <- p[i,j]
+    }
+  }
+  
+  for(i in 1:N){
+    p[i,i] <- 0
+  }
+})
+
+## constants, data, and initial values
+glmConsts2 <- list(N = nC)
+
+
+# Prepare data: easier to do in R than in nimble model definition
+glmData2 <- list(
+  y = A,
+  x = outer(reg,reg, FUN = "==")*1 # x_ij = 1(region_i == region_j)
+)
+
+glmInits2 <- list(beta0 = 0, beta1 = 0, z = ifelse(A==1, 1, -1), p = matrix(0, nC, nC))
+
+# Create the model object
+glmModel2 <- nimbleModel(code = glmCode2, constants = glmConsts2, data = glmData2, 
+                         inits = glmInits2)
+
+# Check conjugacy
+configureMCMC(glmModel2, print = TRUE)
+
+
+# MCMC invocation
+niter <- 2000
+nchains <- 2
+mcmc.out2 <- nimbleMCMC(code = glmCode2, constants = glmConsts2,
+                       data = glmData2, inits = glmInits2,
+                       nchains = nchains, niter = niter,
+                       summary = TRUE, WAIC = TRUE,
+                       monitors = c('beta0', 'beta1', 'p'))
+
+```
+
+***
+### Exercise
+Refit the basic GLM with the conjugate sampler? How does the conjugate sampler compare to the Random Walk sampler? Does Gibbs sampling have much of an advantage in this case? Why or why not? What happens if we store `z` instead of `p`, can we use the posterior samples of `z` to evaluate our model? Is the WAIC meaningful for this parameterization?
+***
+
+
+```{r}
+mcmc.out2$WAIC
+
+samples2 <- mcmc.out2$samples
+all.samples2 <- do.call(rbind, mcmc.out2$samples) # as matrix
+
+# Extract posterior samples of the probability matrix
+p.samples2 <- all.samples2[, grepl("p", colnames(all.samples2))]
+p.post2 <- matrix(data = colMeans(p.samples2), byrow = FALSE, nrow = nC, ncol = nC)
+
+df2 <- data.frame(pred = p.post2[upper.tri(p.post2)], data = obsA)
+plot.roc(df2$data ~ df2$pred, main = "ROC curve - GLM with conjugate sampler", print.auc = TRUE, percent = TRUE)
+
+```
+
+# Random effects in the RW sampler
+
+The model above is incredibly inflexible: we describe the entire network with only
+two probabilities. To permit greater heterogeneity in connectivity patterns, we could
+introduce a random effect for each country. 
+
+*** 
+### Exercise
+***
+
+Write out the mathematical form of the random effects model described above and
+implement it in NIMBLE, first using the Random Walk sampler. Compare the model above. 
+
+
+*Answer*
+```{r glmm, cache = TRUE, message = FALSE}
+
+## define the model
+glmmCode <- nimbleCode({
+  # Priors
+  #beta0 ~ dnorm(0, sd = 1)
+  beta1 ~ dnorm(0, sd = 1)
+  sigma_RE ~ dunif(0, 10)
+  
+  # Model
+  for(i in 1:N){ # Random effects for each vertex
+    beta2[i] ~ dnorm(0, sd = sigma_RE)
+  }
+  for (i in 2:N) { # Likelihood 
+    for (j in 1:(i-1)){
+      logit(p[i,j]) <- beta1 * x[i,j] + beta2[i] + beta2[j]
+      p[j,i] <- p[i,j]
+      y[i,j] ~ dbin(size = 1, prob = p[i,j])
+    }
+  }
+  
+  for(i in 1:nC){ # clunky code to avoid NA in p matrix
+    p[i,i] <- 0
+  }
+})
+
+
+## constants, data, and initial values
+glmmConsts <- list(N = nC)
+
+
+# Prepare data: easier to do in R than in nimble model definition
+reg <- as.factor(features$region)
+glmmData <- list(
+  y = A,
+  x = outer(reg,reg, FUN = "==")*1 # x_ij = 1(region_i == region_j)
+)
+
+glmmInits <- list(beta1 = 0, beta2 = rep(0,nC), p = matrix(0, nC, nC))
+
+## create the model object
+glmmModel <- nimbleModel(code = glmmCode, constants = glmmConsts, data = glmmData, 
+                         inits = glmmInits)
+
+# A. Easiest way to do this: 
+niter <- 2000
+nchains <- 2
+mcmc.glmm.out <- nimbleMCMC(code = glmmCode, constants = glmmConsts,
+                       data = glmmData, inits = glmmInits,
+                       nchains = nchains, niter = niter,
+                       summary = TRUE, WAIC = TRUE,
+                       monitors = c('beta1', 'beta2', 'p'))
+
+
+```
+
+```{r}
+mcmc.glmm.out$WAIC
+samples.glmm <- mcmc.glmm.out$samples
+all.samples.glmm <- do.call(rbind, mcmc.glmm.out$samples) # as matrix
+
+# Extract posterior samples of the z and computed probability matrix
+p.samples.glmm <- all.samples.glmm[, grepl("p", colnames(all.samples.glmm))]
+p.post.glmm <- matrix(data = colMeans(p.samples.glmm), byrow = FALSE, nrow = nC, ncol = nC)
+
+df.glmm <- data.frame(pred = p.post.glmm[upper.tri(p.post.glmm)], data = obsA)
+plot.roc(df.glmm$data ~ df.glmm$pred, main = "ROC curve - GLMM", print.auc = TRUE, percent = TRUE)
+confusionMatrix(data = factor(ifelse(df.glmm$pred > 0.5, 1, 0)), reference = factor(df.glmm$data))
+
+```
+
+# Random effects in the conjugate sampler
+
+***
+### Exercise
+
+Repeat the above, fitting the random effects network regression with the
+conjugate sampler. For which parameters does Nimble detect conjugacy? Add $z$
+to the list of stored parameters so that we can use it to construct posterior 
+edge probabilities. Compare this model to the others. 
+
+***
+
+*Answer*
+```{r, cache = TRUE, message = FALSE}
+
+## define the model
+glmmCode2 <- nimbleCode({
+ 
+  #beta0 ~ dnorm(0, sd = 1) # Drop intercept
+  beta1 ~ dnorm(0, sd = 1)
+  sigma_RE ~ dunif(0, 10)
+  
+  # Model
+  for(i in 1:N){ # Random effects for each vertex
+    beta2[i] ~ dnorm(0, sd = sigma_RE)
+  }
+  for (i in 2:N) { # Likelihood 
+    for (j in 1:(i-1)){
+      y[i,j] ~ dinterval(z[i,j], 0)
+      z[i,j] ~ dnorm(beta1*x[i,j] + beta2[i] + beta2[j], 1)
+      
+    # Computed quantities
+      p[i,j] <- phi(beta1*x[i,j] + beta2[i] + beta2[j])
+      p[j,i] <- p[i,j]
+    }
+  }
+  
+ for (i in 1:N){
+   p[i,i] <- 0 # avoid errors in stored parameters
+ }
+})
+
+
+## constants, data, and initial values
+glmmConsts2 <- list(N = nC)
+
+
+# Prepare data: easier to do in R than in nimble model definition
+glmmData2 <- list(
+  y = A,
+  x = outer(reg,reg, FUN = "==")*1 # x_ij = 1(region_i == region_j)
+)
+
+glmmInits2 <- list(beta1 = 0, beta2 = rep(0,nC), 
+                   z = ifelse(A == 1, 1, -1))
+
+## create the model object
+glmmModel2 <- nimbleModel(code = glmmCode2, constants = glmmConsts2, data = glmmData2, 
+                         inits = glmmInits2)
+
+configureMCMC(glmmModel2, print = TRUE)
+
+# A. Easiest way to do this: 
+niter <- 2000
+nchains <- 2
+mcmc.glmm.out2 <- nimbleMCMC(code = glmmCode2, constants = glmmConsts2,
+                       data = glmmData2, inits = glmmInits2,
+                       nchains = nchains, niter = niter,
+                       summary = TRUE, WAIC = TRUE,
+                       monitors = c('beta1', 'beta2', 'p'))
+
+mcmc.glmm.out2$WAIC
+
+samples.glmm2 <- mcmc.glmm.out2$samples
+all.samples.glmm2<- do.call(rbind, mcmc.glmm.out2$samples) # as matrix
+
+# Extract posterior samples of the probability matrix
+p.samples.glmm2 <- all.samples.glmm2[, grepl("p", colnames(all.samples.glmm2))]
+p.post.glmm2 <- matrix(data = colMeans(p.samples.glmm2), byrow = FALSE, nrow = nC, ncol = nC)
+
+df.glmm2 <- data.frame(pred = p.post.glmm2[upper.tri(p.post.glmm2)], data = obsA)
+plot.roc(df.glmm2$data ~ df.glmm2$pred, main = "ROC curve - GLMM", print.auc = TRUE, percent = TRUE)
+confusionMatrix(data = factor(ifelse(df.glmm2$pred > 0.5, 1, 0)), reference = factor(df.glmm2$data))
+
+```
+
+***
+
+# ASSIGNMENT
+Continue working with your selected data set and fit one of the network regressions
+above. Can you define any edge covariates? Is there a hierarchical structure you
+could consider when defining random effects? Feel free to experiment with different
+samplers in Nimble (e.g. adaptive block Random Walk). Additionally, if you are
+familiar with it, you may choose to include data splitting in your validation approach. 
+
+***
+
+
+

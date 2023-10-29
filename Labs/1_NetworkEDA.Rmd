@@ -1,0 +1,551 @@
+---
+title: "EDA for Networks"
+output: html_document
+date: "2023-10-06"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = FALSE, message = FALSE}
+## Set directories
+data_path <- 'Data/'
+save_path <- 'Data/'
+
+# Load packages
+library(tidyverse)
+library(here)
+library(igraph)
+library(ggraph)
+library(RColorBrewer)
+library(pheatmap)
+library(nimble)
+library(nimbleHMC)
+library(bayesplot)
+
+# Do we want to save any output?
+save_files <- FALSE
+
+```
+TO DO: 
+
+-   Add question about small world path length distribution
+-   Think about improving the flow of definitions
+-   Explain rotation interp of spectral decomp
+-   Maybe add small world sims before small world question
+-   Take out some bad graphs instead explain scaling  
+-   Do a better job characterizing the trade network wrt metrics
+
+# Network data structures
+
+To introduce some of the most useful techniques for working with network
+data, we begin with an example based on trade flows involving OECD
+countries in 2021.
+
+Note: the terms "vertex", "node", "country" can and will used
+interchangeably in this example, as can "edge",
+"link","connection","trade flow."
+
+## Load and explore the data
+
+Network data is typically provided as a data frame in which the first
+two columns contain identifiers between which an edge is observed, and
+additional columns define edge attributes. Alternately, data may be
+provided as an edge list, a two column matrix containing only the vertex
+identifiers.
+
+Our OECD data is stored as a data frame with supplementary information
+in the accompanying file `tradecountries.txt`. We load both in the code
+below.
+
+```{r load_data}
+# Load the files
+file_path1 <- here::here(paste0(data_path, "2021Trade/trade2021.txt"))
+trade <- read.table(file_path1, sep = '\t',header = TRUE, skip = 0 ,quote='', comment='')
+
+file_path2 <- here::here(paste0(data_path, "2021Trade/tradecountries.txt"))
+trade.countries <- read.csv(file_path2, sep = '\t',header = TRUE, skip = 0 ,quote='', comment='')
+```
+
+Browsing the data, we see that it is provided as a directed, weighted
+edge list with direction corresponding to the flow from exporter to
+importer and weight corresponding to the value of the trade flow.
+Additionally, we notice that we have more recipient ("to") countries
+than reporting countries ("from). Also note that since trade flows of
+any size are reported, this is a highly dense network.
+
+```{r}
+head(trade)
+
+# Note we have more to countries than from and only from countries are in our country list
+unique(trade$from)
+unique(trade$to)
+trade.countries
+
+# Consider the proportion of edges realized
+nC.from <- length(unique(trade$from))
+nC.to <- length(unique(trade$to))
+nC.from*(nC.to - 1)
+nrow(trade)
+```
+
+To begin visualizing the network, we use the default plotting function of the
+`igraph` package - don't worry if it doesn't look great, we'll improve the 
+aesthetics later!
+
+```{r}
+# Convert the data frame into an igraph object and view
+g <- graph_from_data_frame(trade, directed = TRUE)
+plot(g) 
+```
+
+## Subset and transform the data
+
+Next, we simplify our data from a very dense, weighted, directed network
+to a sparse weighted, undirected network. The most important question is
+how to meaningfully define an edge. In this case, let's define an edge
+to indicate a strong mutual trade relationship: an edge exists between
+countries A and B if A sends at least 1% of its exports to B and B also
+sends at least 1% of its exports to B.
+
+To compute this, we'll first need to compute the total value of exports
+from each country in the list and restrict our data to countries for
+which we have both import and export data (OECD countries).
+
+```{r, cleaning1}
+
+# Restrict dataset to countries with both imports and exports (i.e., OECD countries)
+trade.plus <- trade[trade$to %in% trade$from, ] %>% # restrict countries
+  group_by(from) %>% 
+  mutate(amount_total_from = sum(amount)) %>% # create variable to record total exports
+  mutate(prop_from = amount/amount_total_from ) %>% 
+  ungroup() %>% 
+  group_by(to) %>% 
+  mutate(amount_total_to = sum(amount)) %>% # create variable to record total imports
+  mutate(prop_to = amount/amount_total_to)
+
+# Add a new useful variable: our network will be undirected
+# Replace to-from columns with undirected vertex list (alphabetized)
+trade.plus$country1 <- apply(trade.plus, 1, function(x) sort(unlist(c(x[1], x[2])))[1])  
+trade.plus$country2 <- apply(trade.plus, 1, function(x) sort(unlist(c(x[1], x[2])))[2])  
+
+# Define a new edge type by thresholding the proportional trade values
+trade.subset <- trade.plus %>% 
+                filter(prop_from > 0.01 & prop_to > 0.01) %>%
+                group_by(country1, country2) %>% 
+                mutate(trade_volume = sum(amount)) %>% 
+                select(country1, country2, trade_volume) %>% 
+                unique()
+
+nrow(trade.subset) # much more sparse!
+```
+
+While the simplified network above will be our primary data set, we can preserve
+additional vertex features in a separate data frame.
+```{r}
+# Preserve the node-specific vars above in the vertex df
+trade.countries.subset <- trade.countries %>% 
+        filter(code %in% union(unique(trade.subset$country1 ), unique(trade.subset$country2))) %>%
+        inner_join(., trade.plus, by = c("code" = "from")) %>%
+        select(code, name, amount_total_from) %>%
+        unique() %>% 
+        mutate(region = ifelse(code == "AUS" | code == "NZL", "Oceania", 
+                        ifelse(code == "CHL" , "South America", 
+                        ifelse(code == "ISR" | code == "TUR", "Middle East",
+                        ifelse(code == "USA" | code == "MEX" | code == "CAN", "North America",
+                        ifelse(code == "JPN", "Asia", "Europe"))))))
+
+
+```
+
+# Visualization
+
+## Graphs
+
+Now that we have a more sparse network, we can visualize it
+as a graph with nodes representing countries, and edges representing a
+strong mutual trade relationshiop as defined above.
+
+We begin by experimenting with different graph layouts, including the
+force-directed Fruchterman-Reingold algorithm.
+
+```{r, vis, fig.height = 10}
+# Convert our subset data frame to an igraph object
+g <- graph_from_data_frame(trade.subset, directed = FALSE, vertices = trade.countries.subset)
+
+# Experiment with layouts
+par(mfrow = c(2,2))
+plot(g, main = "Default") # Force directed
+plot(g, layout = layout.circle, main = "Circle")
+plot(g, layout = layout.sphere, main = "Sphere")
+plot(g, layout = layout.fruchterman.reingold, main = "Fruchterman Reingold")
+par(mfrow = c(1,1))
+```
+
+Next, we can add edge weight, representing the total volume of trade
+between two countries, and node size, representing the total amount
+exported from each country. Both attributes should be scaled *roughly*
+to a (0,1) interval. We experiment with a few transformations below. 
+
+
+```{r}
+# Set edge and scale weights
+E(g)$weight <- trade.subset$trade_volume
+E(g)$weight <- E(g)$weight / max(E(g)$weight) # scale by max
+E(g)$weight <- log(trade.subset$trade_volume) # log volume
+E(g)$weight <- as.numeric(scale(trade.subset$trade_volume, center = FALSE)) # scale by sd, as.numeric removes the scaling attribute
+
+# Set node size
+V(g)$size <- trade.countries.subset$amount_total_from
+V(g)$size <- V(g)$size/max(V(g)$size)
+V(g)$size <- log(trade.countries.subset$amount_total_from)
+
+# Color and labels
+V(g)$name <- trade.countries.subset$code
+V(g)$color <- as.factor(trade.countries.subset$region)
+
+k1 <- 5
+k2 <- 5
+plot(g, edge.width = E(g)$weight/5, vertex.size = V(g)$size/5)
+plot(g, edge.width = E(g)$weight/k1, vertex.size = V(g)$size/k2) 
+```
+
+
+While node size and edge width appear to be reasonable scaled, the nodes still appear too
+small, and there is too much text overlap. While we can produce
+effective graphs using the `igraph` package, `ggraph` offers greater
+control of graph aesthetics. Basic usage is demonstrated below, and a
+useful tutorial is
+[here](https://www.mr.schochastics.net/material/netVizR/).
+
+```{r}
+# Pass the igraph object created above to ggraph
+ggraph(g, layout = 'stress') + 
+  geom_edge_link(aes(width = weight), alpha = 0.25) + # Set edge weight with attributes of g
+  scale_edge_width(range = c(0.5, 2.5)) +  # Constrain edge width
+  geom_node_point(aes(size = size, color = color), alpha = 0.5) + # Set node color with attributes of g
+  scale_size(range = c(2,10)) + # Constrain node sizes
+  geom_node_text(aes(label = name), repel = TRUE, point.padding = unit(0.5, "lines")) + 
+  theme_void() + 
+  theme(legend.position = "none")
+
+```
+
+## Adjacency matrices and heatmaps
+
+While there are many ways to express network data, the most useful
+mathematical representation is through an *adjacency matrix*: a binary
+adjacency matrix $A$ has entries $A_{ij} = 1$ if node $i$ and node $j$
+have a link and 0 otherwise. While we will mostly be working with binary
+adjaceny matrices this week, note that the components could also
+indicate counts indicating the number of links between nodes, or weights
+indicating the intensity of the link.
+
+We begin by extracting the adjacency matrix from our graph object.
+
+```{r}
+# Create adjacency matrix and define number of countries 
+A.dgC <- as_adjacency_matrix(g) # Gives us a dgC matrix object
+A <- as.matrix(A.dgC) # simple numeric array
+nC <- nrow(trade.countries.subset)
+```
+
+The adjacency matrix easily lends itself to the heatmap visualization in
+which the values of our adjacency matrix are depicted with different
+colors. Typically, the rows of an adjacency matrix (nodes) are reordered
+by a clustering algorithm to produce a more effective visualization.
+
+We can also provide an annotation dataframe which can be used to label the rows and columns. 
+
+```{r}
+# Create annotation dataframe
+df.an <- trade.countries.subset %>% # annotation df must have same rownames as A
+         remove_rownames() %>%
+         column_to_rownames(var = "code") %>%
+         select(region)
+
+# Basic heatmap: nice, but I always forget if red means high or low
+pheatmap(A)
+
+# Annotated heatmap: grayscale
+pheatmap(A, cluster_rows = T, cluster_cols = T,
+         color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30), 
+         main = "Observed Adjacency Matrix", 
+         fontsize = 8, show_rownames = T, show_colnames = F, 
+         legend = F, annotation_col = df.an)
+```
+
+------------------------------------------------------------------------
+
+### Exercise
+
+Create a heatmap using edge weights for the color value. Does the clustering changerelative to the binary heatmap created above?
+
+------------------------------------------------------------------------
+
+*Answer*
+
+```{r}
+# Add edge weights: log will work better for this
+E(g)$weight <- log(trade.subset$trade_volume) # log
+A.weighted <- as_adjacency_matrix(g, attr = "weight")
+pheatmap(A.weighted, cluster_rows = T, cluster_cols = T,
+         color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30), 
+         main = "Observed Adjacency Matrix", 
+         fontsize = 8, show_rownames = T, show_colnames = F, 
+         legend = T, annotation_col = df.an)
+
+
+```
+
+## Plotting the spectral decomposition
+
+One additional visualization involves representing nodes by their
+corresponding components in the leading two eigenvectors. Because our
+graph is undirected, its adjacency matrix is symmetric (and real) and so
+it is orthogonally diagonalizable and its eigenvalues are real.
+
+```{r}
+# Take spectral decomposition of the unweighted adjacency matrix
+eig.A <- eigen(A)
+
+# Plot posterior clustering
+evec.A <- eig.A$vectors
+
+data.frame(V1 = evec.A[,1], V2 = evec.A[,2], Region = as.factor(trade.countries.subset$region), 
+                 size = rowSums(A), code = trade.countries.subset$code) %>% 
+  ggplot(aes(x = V1, y = V2, color = Region, size = size, label = code), alpha = 0.25) + 
+  #geom_jitter() + 
+  geom_text(check_overlap = TRUE, show.legend = FALSE) + 
+  theme_minimal() + 
+  guides(size = "none") + 
+  labs(title = "Data") + 
+  scale_color_viridis_d()
+
+```
+
+In the plot above, text size corresponds represents the degree of each
+node, what do you notice about the relationship between degree and the
+first eigenvector?
+
+# Network and vertex statistics
+
+## Vertex metrics
+
+As suggested above, the spectral decomposition leads to a useful measure
+of the overall influence of a node or vertex in the network, known as
+the *eigenvector centrality*. Recall the other key vertex metrics discussed in lecture:
+
+-   *Eigenvector centrality*: $x_i = 1/\lambda \sum_{j \in N(i)} x_i = 1/\lambda \sum_{j \in V} a_{i,j} x_j$, 
+    where $x_i$ is the centrality score of node $i$; this implies that a node's
+    centrality socre is proportional to the sum of the centrality scores of its neighbors; measure of a node's influence in a network
+-   *Degree*: $d_i = \sum_{j \neq i} y_{ij}$ is the number of edges
+    between node $i$ and other nodes
+-   *Betweenness centrality*: the sum of proportions of shortest paths
+    that pass through a given vertex. Let $\sigma_{jk}$ denote the total
+    number of shortest paths between nodes $j,k$ and $\sigma_{jk} (i)$
+    denote the number of shortest paths that pass through $i$. Then the
+    betweenness centrality of node $i$ is
+    $\sum_{i \neq j \neq k}\frac{\sigma_{jk}(v)}{\sigma_{jk}}$. Note
+    that betweenness as defined above scales with the number of node
+    pairs and so it is useful to normalize by dividing by the number of
+    (undirected) pairs excluding $i$, $(N-1)(N-2)/2$
+-   *Closeness centrality*: inverse sum of shortest path lengths
+    $s_{ij}$ to every other node from node $i$ (only defined for
+    connected graphs): $\frac{1}{\sum_{j \neq i} s_{ij}}$. We can
+    normalize by instead taking the inverse of the average shortest path
+    length.
+
+
+To compute these in R:
+```{r}
+
+# Degree: most basic property, number of edges adjacent to a vertex
+degree <- rowSums(A)
+
+# Betweenness
+betweenness(g, v = V(g), directed = FALSE, weights = NA)
+betweenness(g, v = V(g), directed = FALSE, weights = NA, normalized = TRUE)
+
+# Closeness 
+closeness(g, vids = V(g), weights = NA)
+closeness(g, vids = V(g), weights = NA, normalized = TRUE)
+
+# Eigen centrality
+eigen_centrality(g, weights = NA)$vector
+eigen(A)$vectors[,1]
+
+```
+
+------------------------------------------------------------------------
+
+### Exercise
+
+Comment on degree distribution. Does this network have hubs? 
+
+Verify that eigencentrality is proportional to the sum of neighbors' eigencentrality for 
+one or two nodes. 
+
+------------------------------------------------------------------------
+
+*Answer*
+
+```{r}
+mean(degree)
+hist(degree, breaks = 10)
+abline(v = mean(degree))
+
+cbind(eigen(A)$vectors[,1], trade.countries.subset$code)
+sum(eigen(A)$vectors[,1]) 
+eigen(A)$values
+
+eigen_centrality(g, weights = NA)$vector
+sum(eigen_centrality(g, weights = NA)$vector)
+
+```
+
+## Network metrics
+
+While vertex summaries measure the influence of any given vertex in the
+network, network metrics provide a variety of insights into the overall
+structure of a network.
+
+### Clustering coefficients
+
+The first network-level summary we'll consider is the clustering
+coefficient, which measures the tendency of nodes to cluster. Let
+$\mathcal{N}_i = \{j: y_{ij} =1\}$ denote the set of all nodes connected
+to node $i$. In the code below we calculate the following clustering
+statistic:
+
+-   *Local clustering coefficient*: the proportion of possible links in
+    $\mathcal{N}_i$ that are realized:
+    $C_i = \frac{2} {|\mathcal{N}_i|(|\mathcal{N}_i|-1)}\sum_{j:y_{ij}=1,k:y_{ik}=1}y_{jk}$
+-   *Global clustering coefficient*: the proportion of all triplets that
+    are closed
+    $C = \frac{\sum_{i,j,k} y_{ij}y_{ik}y_{jk}}{\sum_i |\mathcal{N}_i|(|\mathcal{N}_i|-1)}$
+-   *Network average clustering coefficient*:
+    $\overline{C}=(1/n)\sum_{i=1}^n C_i$
+
+```{r}
+
+# Local clustering coefficient
+C.i <- transitivity(g, type = "localundirected")
+cbind(trade.countries.subset$name, round(C.i, 2))
+
+# Global clustering coefficient
+C <- transitivity(g, type = "globalundirected")
+C
+
+# Network average clustering coefficient
+C.bar <- transitivity(g, type = "localaverageundirected")
+C.bar
+mean(C.i, na.rm = TRUE)
+```
+
+### Shortest paths and small world networks
+
+Random graphs generated from the Erdos-Renyi model exhibit small
+clustering coefficients and small average shortest path length.
+
+Small world networks: the distance $L$ between any two randomly chosen
+nodes grows proportionally to $log(N)$, where $N$ is the number of nodes
+in the network. Small world networks are characterized by high values of
+clustering coefficient and low average path length between nodes, with
+
+$L \propto log(N)$
+
+```{r}
+sps <- shortest.paths(g, v = V(g), to = V(g), weights = NA)
+mean(sps[upper.tri(sps)])
+
+```
+
+------------------------------------------------------------------------
+
+### Exercise
+
+Does it appear that our trade network displays the small world property? 
+Does our network resemble and Erdos-Renyi random graph?
+
+```{r}
+g.sw <- sample_smallworld(dim = 1, size = 100, nei = 3, loops = FALSE, multiple = FALSE, p = 0.05)
+sps <- shortest.paths(g.sw, v = V(g.sw), to = V(g.sw), weights = NA)
+hist(sps)
+
+
+```
+
+------------------------------------------------------------------------
+
+### Other network stats.
+
+-   *Diameter*: length of the longest shortest path
+-   *Density*: proportion of all possible edges that are realized
+-   *Modularity*: measures the tendency of a graph to cluster with
+    respect to an observed node membership variable
+
+```{r}
+
+# Connectance aka density: number of observed interactions divided by the number of possible interactions
+sum(A[lower.tri(A)])/(nC*(nC -1)/2)
+edge_density(g)
+
+# Diameter
+diameter(g, directed = FALSE, weights = NA)
+max(sps)
+
+# Modularity
+modularity(g, membership = as.numeric(as.factor(trade.countries.subset$region)), weights = NULL)
+
+```
+
+------------------------------------------------------------------------
+
+### Exercise
+
+Characterize the trade network with respect to the vertex and network
+metrics described above. Is the network structure robust to different
+edge definitions and subsets?
+
+------------------------------------------------------------------------
+
+### Save the clean data
+
+Save the clean, subset network for use in subsequent exercises.
+
+```{r save}
+
+if(save_files){
+  write.csv(A, here::here(paste0(data_path, "2021Trade/A_subset.csv")), row.names = FALSE)
+  write.csv(trade.countries.subset, here::here(paste0(data_path, "2021Trade/Features_subset.csv")), row.names = FALSE)
+}
+```
+
+------------------------------------------------------------------------
+
+### Exercise
+
+***
+
+Throughout the course of the week you will be analyzing a data set of
+your choice. Selct a data set from among:
+
+-   The example data sets provided in Data folder of the course Github
+    repo (excluding of course the small trade dataset that we have used
+    in this exercise)
+
+-   The various network data repositories shared in the Course resources
+    document
+
+-   Any network data sets you have encountered in your work and research
+
+Perform EDA on your selected network, starting with the techniques
+above. Because the majority of models discussed in this course will
+apply to undirected graphs, select a data set where an undirected edge
+can meaningfully be defined. Additionally, think about potential edge
+covariates.

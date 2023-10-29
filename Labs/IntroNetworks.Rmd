@@ -1,0 +1,416 @@
+---
+title: "Intro to networks lab"
+output: html_document
+date: "2023-10-06"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = FALSE, message = FALSE}
+## Set directories
+data_path <- 'Data/'
+save_path <- 'Data/'
+
+# Load packages
+library(tidyverse)
+library(here)
+library(igraph)
+library(ggraph)
+library(RColorBrewer)
+library(pheatmap)
+library(nimble)
+library(nimbleHMC)
+library(bayesplot)
+
+# Do we want to save any output?
+save_files <- TRUE
+
+```
+
+# TO DO:
+
+-   Add network summary stats definitions
+-   Add intro to Nimble text
+-   Turn RE into separate question
+-   Figure out why Nimble isn't dropping a level in the RE model
+-   Figure out how to change variable names for MCMC diagnostics
+
+# PART 1: THE STRUCTURE OF NETWORK DATA
+
+To introduce some of the most useful techniques for working with network
+data, we begin with an example based on trade flows involving OECD
+countries in 2021.
+
+Note: the terms "vertex", "node", "country" can and will used
+interchangeably in this example, as can "edge",
+"link","connection","trade flow."
+
+## 1a. Load and explore the data
+
+Network data is typically provided as a data frame in which the first
+two columns contain identifiers between which an edge is observed, and
+additional columns define edge attributes. Alternately, data may be
+provided as an edge list, a two column matrix containing only the vertex
+identifiers.
+
+Our OECD data is stored as a data frame.
+
+```{r load_data}
+# Load the files
+file_path1 <- here::here(paste0(data_path, "2021Trade/trade2021.txt"))
+trade <- read.table(file_path1, sep = '\t',header = TRUE, skip = 0 ,quote='', comment='')
+file_path2 <- here::here(paste0(data_path, "2021Trade/tradecountries.txt"))
+trade.countries <- read.csv(file_path2, sep = '\t',header = TRUE, skip = 0 ,quote='', comment='')
+
+# Look at the data: note that it's a directed, weighted edge list
+head(trade)
+
+# Note we have more to countries than from and only from countries are in our country list
+unique(trade$from)
+unique(trade$to)
+trade.countries
+
+# Now: we still have a lot of (directed) edges
+nC.from <- length(unique(trade$from))
+nC.to <- length(unique(trade$to))
+nC.from*(nC.to - 1)
+nrow(trade)
+
+g <- graph_from_data_frame(trade, directed = TRUE)
+plot(g) # This is kind of a mess
+```
+
+## 1b. Subset and transform the data
+
+Next, we simplify our data from a very dense, weighted, directed network
+to a sparse weighted, undirected network. The most important question is
+how to meaningfully define an edge. In this case, let's define an edge
+to indicate a strong mutual trade relationship: an edge exists between
+countries A and B if A sends at least 1% of its exports to B and B also
+sends at least 1% of its exports to B.
+
+To compute this, we'll first need to compute the total value of exports
+from each country in the list and restrict our data to countries for
+which we have both import and export data (OECD countries).
+
+```{r, cleaning1}
+
+# Restrict dataset to countries with both imports and exports (i.e., OECD countries)
+trade.plus <- trade[trade$to %in% trade$from, ] %>% # restrict countries
+  group_by(from) %>% 
+  mutate(amount_total_from = sum(amount)) %>% 
+  mutate(prop_from = amount/amount_total_from ) %>% 
+  ungroup() %>% 
+  group_by(to) %>% 
+  mutate(amount_total_to = sum(amount)) %>% 
+  mutate(prop_to = amount/amount_total_to)
+
+# Add a new useful variable
+trade.plus$country1 <- apply(trade.plus, 1, function(x) sort(unlist(c(x[1], x[2])))[1])  
+trade.plus$country2 <- apply(trade.plus, 1, function(x) sort(unlist(c(x[1], x[2])))[2])  
+
+# Let's come up with a meaninful definintion of an edge
+# And the weight
+
+trade.subset <- trade.plus %>% 
+                filter(prop_from > 0.01 & prop_to > 0.01) %>%
+                group_by(country1, country2) %>% 
+                mutate(trade_volume = sum(amount)) %>% 
+                select(country1, country2, trade_volume) %>% 
+                unique()
+
+nrow(trade.subset) # much more sparse!
+
+# Preserve the node-specific vars above in the vertex df
+trade.countries.subset <- trade.countries %>% 
+        filter(code %in% union(unique(trade.subset$country1 ), unique(trade.subset$country2))) %>%
+        inner_join(., trade.plus, by = c("code" = "from")) %>%
+        select(code, name, amount_total_from) %>%
+        unique() %>% 
+        mutate(region = ifelse(code == "AUS" | code == "NZL", "Oceania", 
+                        ifelse(code == "CHL" , "South America", 
+                        ifelse(code == "ISR" | code == "TUR", "Middle East",
+                        ifelse(code == "USA" | code == "MEX" | code == "CAN", "North America",
+                        ifelse(code == "JPN", "Asia", "Europe"))))))
+
+
+```
+
+Now we have a much more sparse network where edges indicate a strong
+trade relationship.
+
+# PART 2: Visualization
+
+## 2a. Graphs
+
+```{r, vis, fig.height = 10}
+# In the real world networks are usually large and sparse and stored as edge lists
+
+## Scenario 1: Directed, weighted, with annotations/meta data
+g <- graph_from_data_frame(trade.subset, directed = FALSE, vertices = trade.countries.subset)
+
+par(mfrow = c(2,2))
+plot(g, main = "Default") # this looks terrible
+plot(g, layout = layout.circle, main = "Circle")
+plot(g, layout = layout.sphere, main = "Sphere")
+plot(g, layout = layout.fruchterman.reingold, main = "Fruchterman Reingold")
+par(mfrow = c(1,1))
+
+# Nice to add edge weight = total volume of trade, and node size = total amount_from
+# hist(trade.subset$trade_volume)
+# hist(log(trade.subset$trade_volume))
+
+# Add some fancy stuff
+E(g)$weight <- log(trade.subset$trade_volume) # scale volume, as.numeric removes the scaling attribute
+E(g)$weight <- as.numeric(scale(trade.subset$trade_volume, center = FALSE)) # scale volume, as.numeric removes the scaling attribute
+#V(g)$size <- as.numeric(scale(trade.countries.subset$amount_total_from, center = FALSE))
+V(g)$size <- log(trade.countries.subset$amount_total_from)# scale exports, as.numeric removes the scaling attribute
+V(g)$name <- trade.countries.subset$code
+V(g)$color <- as.factor(trade.countries.subset$region)
+plot(g, edge.width = E(g)$weight/5, vertex.size = V(g)$size/5) # nodes too small, too much text, overlapping
+
+# igraph objects can be passed to ggraph calls, which have better control of aesthetics 
+ggraph(g, layout = 'stress') + 
+  geom_edge_link(aes(width = weight), alpha = 0.25) + # Set edge weight with attributes of g
+  scale_edge_width(range = c(0.5, 2.5)) +  # Constrain edge width
+  geom_node_point(aes(size = size, color = color), alpha = 0.5) + # Set node color with attributes of g
+  scale_size(range = c(2,10)) + # Constrain node sizes
+  geom_node_text(aes(label = name), repel = TRUE, point.padding = unit(0.5, "lines")) + 
+  theme_void() + 
+  theme(legend.position = "none")
+
+```
+
+## 2b. Adjacency matrices and heatmaps
+
+While there are many ways to express network data, the most useful
+mathematical representation is through an *adjacency matrix*: a binary
+adjacency matrix $A$ has entries $A_{ij} = 1$ if node $i$ and node $j$
+have a link and 0 otherwise. While we will mostly be working with binary
+adjaceny matrices this week, note that the components could also
+indicate counts indicating the number of links between nodes, or weights
+indicating the intensity of the link.
+
+```{r}
+# We'll work from the adjacency matrix
+# There are built in commands for a lot of these, but let's work from scratch
+A.dgC <- as_adjacency_matrix(g) # Gives us a dgC matrix
+A <- as.matrix(A.dgC)
+nC <- nrow(trade.countries.subset)
+
+## More visualizations
+df.an <- trade.countries.subset %>% # annotation df must have same rownames as A
+         remove_rownames() %>%
+         column_to_rownames(var = "code") %>%
+         select(region)
+  
+pheatmap(A)
+pheatmap(A, cluster_rows = T, cluster_cols = T,
+         color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30), 
+         main = "Observed Adjacency Matrix", 
+         fontsize = 8, show_rownames = T, show_colnames = F, 
+         legend = F, annotation_col = df.an)
+
+
+# Look at edge weights: log will work better for this
+E(g)$weight <- log(trade.subset$trade_volume) # log
+A.weighted <- as_adjacency_matrix(g, attr = "weight")
+pheatmap(A.weighted, cluster_rows = T, cluster_cols = T,
+         color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30), 
+         main = "Observed Adjacency Matrix", 
+         fontsize = 8, show_rownames = T, show_colnames = F, 
+         legend = T, annotation_col = df.an)
+
+
+```
+
+## 2c. Plotting the spectral decomposition
+
+One more visualization: we can represent nodes by their corresponding
+components in the leading two eigenvectors. Because our graph is
+undirected, its adjacency matrix is symmetric (and real) and so it is
+orthogonally diagonalizable and its eigenvalues are real.
+
+```{r}
+# Take spectral decomposition of the unweighted adjacency matrix
+eig.A <- eigen(A)
+
+# Plot posterior clustering
+evec.A <- eig.A$vectors
+
+data.frame(V1 = evec.A[,1], V2 = evec.A[,2], Region = as.factor(trade.countries.subset$region), 
+                 size = rowSums(A), code = trade.countries.subset$code) %>% 
+  ggplot(aes(x = V1, y = V2, color = Region, size = size, label = code), alpha = 0.25) + 
+  #geom_jitter() + 
+  geom_text(check_overlap = TRUE, show.legend = FALSE) + 
+  theme_minimal() + 
+  guides(size = "none") + 
+  labs(title = "Data") + 
+  scale_color_viridis_d()
+
+```
+
+In the plot above, text size corresponds represents the degree of each
+node, what do you notice about the relationship between degree and the
+first eigenvector?
+
+# PART 3: NETWORK SUMMARIES
+
+As suggested above, the spectral decomposition leads to one of many
+useful approaches for describing a network.
+
+*Add definition and intuition for a few network and vertex level
+summaries*
+
+```{r networksummary}
+
+## Vertex metrics
+
+# Degree: most basic property, number of edges adjacent to a vertex
+rowSums(A)
+
+# Centrality
+# Explain why eigen centrality (v) is proportional to the eigen centrality of its neighbors
+#eigen_centrality(g) # uses edge weights
+#eigen(A) # just uses the binary adjacency matrix
+plot(eigen(A)$values)
+
+# Specialization
+
+
+## Network metrics
+# Connectance: number of observed interactions divided by the number of possible interactions
+  # Measure of complexity
+
+sum(A[lower.tri(A)])/(nC*(nC -1)/2)
+
+# Nestedness, modularity, specialization
+  
+## Use null models to determine if observed network structure is significantly different from random network structure
+
+```
+
+# PART 4. LINK PREDICTION USING LOGISTIC REGRESSION
+
+## 4a. Introduction to NIMBLE using R
+
+*Describe NIMBLE and add more details about the steps to fitting a
+NIMBLE model*
+
+NIMBLE has a predefined list of conjugacies it detects.
+
+NIMBLE quirks: be careful with indexing
+
+-   NIMBLE does not allow multivariate nodes to be used without square
+    brackets
+
+    -   Vector `x`: use `mean(x[ ])`
+
+    -   Matrix `x`: use `mean(x[ , ])`
+
+-   NIMBLE does not permit stochastic indexing: any variables used for
+    indexing must be provided as a constant, be a looping index, or
+    something deterministically derived from these (i.e., no indexing by
+    latent variables or indices that are not constant). If you need to
+    index on a latent variable, create a user-provided function to call
+    within the model
+
+-   Multivariate distributions do not take expressions as arguments: all
+    arguments should be given a deterministic definition prior to the
+    distribution call
+
+-   Predefined list of conjugacy relationships:
+    <https://github.com/nimble-dev/nimble/blob/devel/packages/nimble/R/MCMC_conjugacy.R>
+
+-   Initialize all parameters to be safe: failing to do so will
+    sometiems cause errors
+
+```{r glm}
+
+## define the model
+glmCode <- nimbleCode({
+  # Priors
+  beta0 ~ dnorm(0, sd = 10000)
+  beta1 ~ dnorm(0, sd = 10000)
+  sigma_RE ~ dunif(0, 1000)
+  
+  # Model
+  for(i in 1:N){ # Random effects for each vertex
+    beta2[i] ~ dnorm(0, sd = sigma_RE)
+  }
+  for (i in 2:N) { # Likelihood 
+    for (j in 1:(i-1)){
+      logit(p[i,j]) <- beta0 + beta1 * x[i,j] + beta2[i] + beta2[j]
+      y[i,j] ~ dbin(size = 1, prob = p[i,j])
+    }
+  }
+})
+
+
+## constants, data, and initial values
+glmConsts <- list(N = nC)
+
+
+# Prepare data: easier to do in R than in nimble model definition
+reg <- as.factor(trade.countries.subset$region)
+glmData <- list(
+  y = A,
+  x = outer(reg,reg, FUN = "==")*1 # x_ij = 1(region_i == region_j)
+)
+
+glmInits <- list(beta0 = 0, beta1 = 0, beta2 = rep(0,nC))
+
+## create the model object
+glmModel <- nimbleModel(code = glmCode, constants = glmConsts, data = glmData, 
+                         inits = glmInits)
+
+# A. Easiest way to do this: 
+niter <- 2000
+nchains <- 2
+mcmc.out <- nimbleMCMC(code = glmCode, constants = glmConsts,
+                       data = glmData, inits = glmInits,
+                       nchains = nchains, niter = niter,
+                       summary = TRUE, WAIC = TRUE,
+                       monitors = c('beta0', 'beta1', 'beta2'))
+
+#mcmc.out$summary
+
+```
+
+## 4b. MCMC Diagnostics
+
+*Add description explanation for trace, acf plots, etc, interpretation
+for logistic regression coefficients*
+
+```{r}
+# Not really useful for a single model, but: 
+mcmc.out$WAIC
+
+# Extract samples and change names for convenience
+glm.samples <- mcmc.out$samples
+#glm.samples2 <- lapply(glm.samples, function(x) colnames(x) <- c("Intercept", "Same region", trade.countries.subset$name))
+
+mcmc_trace(glm.samples) 
+mcmc_intervals(glm.samples) # Not dropping a a level where it should, need to fix
+mcmc_acf(glm.samples) 
+
+
+```
+
+Repeat the above but add random effects
+
+```{r save}
+
+if(save_files){
+  write.csv(A, here::here(paste0(data_path, "2021Trade/A_subset.csv")), row.names = FALSE)
+  write.csv(trade.countries.subset, here::here(paste0(data_path, "2021Trade/Features_subset.csv")), row.names = FALSE)
+}
+```
+
+Assignment: find a data set, do some EDA, define an undirected edge, can
+you define any useful edge covariates?
