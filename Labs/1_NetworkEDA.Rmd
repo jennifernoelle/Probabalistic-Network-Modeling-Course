@@ -31,14 +31,6 @@ library(bayesplot)
 save_files <- FALSE
 
 ```
-TO DO: 
-
--   Add question about small world path length distribution
--   Think about improving the flow of definitions
--   Explain rotation interp of spectral decomp
--   Maybe add small world sims before small world question
--   Take out some bad graphs instead explain scaling  
--   Do a better job characterizing the trade network wrt metrics
 
 # Network data structures
 
@@ -287,20 +279,6 @@ Create a heatmap using edge weights for the color value. Does the clustering cha
 
 ------------------------------------------------------------------------
 
-*Answer*
-
-```{r}
-# Add edge weights: log will work better for this
-E(g)$weight <- log(trade.subset$trade_volume) # log
-A.weighted <- as_adjacency_matrix(g, attr = "weight")
-pheatmap(A.weighted, cluster_rows = T, cluster_cols = T,
-         color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30), 
-         main = "Observed Adjacency Matrix", 
-         fontsize = 8, show_rownames = T, show_colnames = F, 
-         legend = T, annotation_col = df.an)
-
-
-```
 
 ## Plotting the spectral decomposition
 
@@ -391,22 +369,6 @@ Verify that eigencentrality is proportional to the sum of neighbors' eigencentra
 one or two nodes. 
 
 ------------------------------------------------------------------------
-
-*Answer*
-
-```{r}
-mean(degree)
-hist(degree, breaks = 10)
-abline(v = mean(degree))
-
-cbind(eigen(A)$vectors[,1], trade.countries.subset$code)
-sum(eigen(A)$vectors[,1]) 
-eigen(A)$values
-
-eigen_centrality(g, weights = NA)$vector
-sum(eigen_centrality(g, weights = NA)$vector)
-
-```
 
 ## Network metrics
 
