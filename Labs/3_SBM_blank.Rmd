@@ -1,0 +1,394 @@
+---
+title: "Basic SBM"
+output: html_document
+date: "2023-09-27"
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_knit$set(root.dir = "..")
+```
+
+```{r echo = FALSE, message = FALSE}
+
+## Packages
+
+# One package will require install from github
+if("mcclust.ext" %in% rownames(installed.packages()) == FALSE) 
+  {devtools::install_github('sarawade/mcclust.ext')}
+library(mcclust.ext)
+
+# The rest are straightforward
+library(nimble)
+library(nimbleHMC)
+library(pheatmap)
+library(RColorBrewer)
+library(tidyverse)
+library(gridExtra)
+library(here)
+library(bayesplot)
+library(pROC)
+
+## Set directories
+data_path <- 'Data/'
+
+```
+
+# Simulate from a general stochastic block model 
+
+First we simulate from a general stochastic block model with no
+constraints on between versus within block connectivity.
+
+Recall the SBM: stochastic equivalence means that edge probability
+between any two nodes is fully determined by group membership
+(summarized in the $n \times K$ matrix $Z$) of the respective nodes,
+group-wise edge probabilities are described by the $K \times K$
+symmetric matrix $\Theta$.
+$$Y_{pq} \mid Z \sim \text{Bernoulli}(Z_{p.}^T \Theta Z_{q.})$$
+
+We assume independent Dirichlet-multinomial priors on group membership and 
+independent beta priors on block connection probabilities:
+
+$$\pi(Z \mid \lambda ) = \prod_{p=1}^n Z_{p.}^T \lambda \\
+    \lambda \sim \text{Dirichlet}(\alpha 1_K) \\
+    \alpha \sim \text{Gamma}(a,b) \\
+    \theta_{ij} \sim \text{Beta}(a,b) \text{ for } i,j = 1, \cdots, K.$$ 
+
+Note that the prior on $\alpha$ above is optional, a reasonable choice as discussed in lecture is $1/K$
+where $K$ is an upper bound on the number of groups.
+
+
+We simulate from this model in the code below. 
+```{r}
+set.seed(100) # 10 gives more clear blocks by chance, 100 less clear
+
+# Setup data structure
+n.nodes <- 50
+n.groups <- 3
+
+# Set hyperparameters
+a <- 2
+b <- 2
+
+# Simulate group membership
+lambda <- rdirch(n=1, alpha = rep(1/n.groups, n.groups)) 
+z <- sample(1:n.groups, size = n.nodes, prob = lambda, replace = TRUE)
+z.mat <- matrix(0, nrow = n.nodes, ncol = n.groups)
+for(i in 1:n.nodes){
+  z.mat[i,z[i]] <- 1
+}
+
+# Simulate connection probabilities
+theta <- matrix(NA, nrow = n.groups, ncol = n.groups) # matrix of group-edge probabilities
+theta[upper.tri(theta, diag = TRUE)] <- rbeta(n = n.groups*(n.groups + 1)/2, a, b)
+theta[lower.tri(theta, diag = TRUE)] <- t(theta)[lower.tri(theta, diag = TRUE)]
+
+# Compute connection probs for each pair of nodes
+pi.mat <- z.mat %*% theta %*% t(z.mat) # ignore diagonal here: no self-edges (loops)
+diag(pi.mat) <- NA
+
+# Simulate data
+Y <- matrix(NA, nrow = n.nodes, ncol = n.nodes)
+Y[upper.tri(Y)] <- rbinom(n.nodes*(n.nodes - 1)/2, 1, pi.mat[upper.tri(pi.mat)])
+Y[lower.tri(Y)] <- t(Y)[lower.tri(Y)]
+rownames(Y) <- colnames(Y) <- paste0("Node ", 1:n.nodes)
+
+# Might need to add diag to Y to avoid errors
+diag(Y) <- 0
+
+# Plot the data
+sel <- order(z)
+z_sorted <- z[sel]
+Y_sorted <- Y[sel, sel]
+
+pheatmap(Y_sorted, cluster_rows = F, cluster_cols = F,
+         color=colorRampPalette(brewer.pal(9,"Greys")[c(1,8)])(30), 
+         main = "Observed Adjacency Matrix", 
+         fontsize = 8, show_rownames = T, show_colnames = T, 
+         legend = F)
+
+```
+
+
+# Fitting a stochastic block model with NIMBLE
+
+Now we define and fit the model with Nimble. 
+
+
+```{r, message = FALSE}
+# Define model with BUGS code
+sbmCode <- nimbleCode({
+  
+  # lambda - latent group assignment probabilties (vector of length K)
+  lambda[1:K] ~ ddirch(alpha[]) 
+  
+  # Z - latent group indicator (binary vector of length K, summing to 1)
+  for(i in 1:N){
+    Z[i] ~ dcat(prob = lambda[])
+  }
+    # theta - symmetric matrix of within and between group edge probabilities
+  for (i in 1:K){
+    theta[i,i] ~ dbeta(shape1 = a, shape2 = b) # Within block connections
+    for (j in 1:(i-1)){ 
+      theta[i,j] ~ dbeta(shape1 = a, shape2 = b) # Between block connections 
+      theta[j,i] <- theta[i,j] # symmetric matrix
+    }
+  }
+
+  # Pi - node to node edge probabilities (based on group membership)
+  for (i in 2:N){
+    for (j in 1:(i-1)){ # Self-edges not allowed
+      Pi[i,j] <- myCalculation(theta[,], Z[i], Z[j]) # Workaround because nimble does not allow indexing by latent variables
+      Y[i,j] ~ dbin(size = 1, prob = Pi[i,j])
+    }
+  }
+
+})
+
+## User-defined functions: written in NIMBLE
+myCalculation <- nimbleFunction(
+  run = function(grid = double(2), index1 = double(0), index2 = double(0)) {  ## index could be int() but model variables are represented as double anyway
+    return(grid[index1, index2])
+    returnType(double(0))
+  })
+
+# Define the constants
+sbmConsts <- list(N = n.nodes, K= n.groups,
+                  a = a, b = b,
+                  alpha =  rep(1/n.groups, n.groups))
+
+# Define the data
+sbmData <- list(Y = Y)
+
+```
+
+***
+
+### Exercise 
+Supply reasonable initial values using basic summaries of the data and data structure. 
+After completing model setup, comment on conjugacy detection, and run the MCMC. 
+
+***
+
+
+```{r, eval = FALSE}
+
+# Set initialization parameters
+sbmInits <- list(lambda = , # block assignment probs
+                 theta = , # edge probs, better init
+                 Pi = , # edge probs
+                 Z = ) # group indicators
+
+# Create NIMBLE model
+sbm <- nimbleModel(code = sbmCode, name = "sbm", constants = sbmConsts, data = sbmData, 
+                   dimensions = list(lambda = c(n.groups), theta = c(n.groups, n.groups), 
+                                     Pi = c(n.nodes, n.nodes)), 
+                   inits = sbmInits)
+# Check conjugacy
+configureMCMC(sbm, print = TRUE)
+
+# Easiest way to run: 
+niter <- 5000
+nchains <- 2
+mcmc.out <- nimbleMCMC(code = sbmCode, constants = sbmConsts,
+                       data = sbmData, inits = sbmInits,
+                       nchains = nchains, niter = niter,
+                       summary = TRUE, WAIC = TRUE,
+                       monitors = c('lambda', 'theta', 'Z'))
+```
+
+Now we evaluate the results. How does mixing look? 
+
+```{r, echo = FALSE}
+
+## MCMC diagnostics
+sbm.samples <- mcmc.out$samples
+
+# Block connection probabilities
+mcmc_trace(sbm.samples, regex_pars = c("theta")) 
+
+# Block assignment probabilities
+mcmc_trace(sbm.samples, regex_pars = c("lambda")) 
+
+```
+
+The trace plots above demonstate (at least) two problems: poor mixing and label switching, 
+and so provide an important reminder about identifiability in the SBM. 
+Often SBMs are used for community detection, and in those cases, inference on $\theta, \lambda$
+is not of particular interest, the clustering assignment is. While sorting $\lambda$ within each 
+chain can often result in consistent block assignment probabilities, post-processing 
+of the clustering labels is a more complex task, which we'll explore below. 
+
+As a quick note on the diagnostics above, keep these in mind that the data was generated
+from a general SBM with relatively weak differences in connectivity patterns from block
+to block. 
+
+
+### Post processing: create a posterior cluster assignment
+
+As we see from the output above, the model does not produce a single
+partitioning of the nodes, but rather a posterior distribution over the
+space of $K$ -partitions. The decision-theoretic approach of Wade and
+Ghahramani (2018) provides a means of summarizing the posterior. One
+method under this approach utilizes the variation of information (VI) as
+a loss function. Intuitively, VI compares the information in two
+partitions to the information common between them; for the technical
+details, see Meila (2007).
+
+We obtain a point estimate for the clustering $\hat{z}$ as the partition
+with the minimum posterior averaged VI distance from the other
+partitions:
+$$\hat{z} = \text{arg min}_{z'} E_z[VI(z,z')|Y].$$
+
+
+The package `mcclust.ext` packages provides several optimization methods
+for the minimization above.
+
+
+```{r}
+# Extract mcmc  samples
+samples <- do.call(rbind, mcmc.out$samples)
+z.samples <- samples[, grepl("Z", colnames(samples))]
+
+# Compute posterior similarity matrix
+z.psm <- comp.psm(z.samples) 
+plotpsm(z.psm) # note data points are reordered by hierarchical clustering here
+
+# Find a representative partition of posterior by minimizing VI
+z.vi <- minVI(z.psm, method = "greedy") 
+summary(z.vi) # if you use method = "all", this compares them all 
+z.cl.post <- z.vi$cl
+```
+
+
+Now that we have identified a representative clustering, we can plot it. 
+
+***
+
+### Exercise
+Plot the posterior clustering vs the true clustering using the method of your choice. 
+How does the model perform on visual inspection?
+
+***
+
+***
+
+### Exercise
+
+Rerun the above code for a few different seeds. How does model performance
+vary? Does it do better on more assortative data?
+
+***
+
+# Simulate from an assortative stochastic block model 
+
+While the general stochastic block model is very flexible and does not
+enforce high within block connectivity, the *assortative* pattern in
+which nodes within a block are more likely to be connected than nodes in
+different blocks is often observed and is a common goal of community
+detection. 
+
+***
+
+### Exercise
+
+Simulate from an assortative SBM and plot the resulting data. To get started, you
+might want to explore the parameters of the Beta distribution, and recall that if
+$x$ has a B$(\alpha, \beta)$ distribution, then $E[X] = \frac{\alpha}{\alpha + \beta}$. 
+
+
+***
+
+```{r}
+
+# Define range
+p = seq(0, 1, length=100)
+
+# Create plot of Beta distribution with various shape parameters
+plot(p, dbeta(p, 2, 10), type='l', ylab = 'Density')
+lines(p, dbeta(p, 2, 2), col='red') 
+lines(p, dbeta(p, 5, 2), col='blue')
+
+legend(x = .7, y = 4, legend = c('Beta(2, 10)','Beta(2, 2)','Beta(5,2)'),
+       lty=c(1,1,1), col=c('black', 'red', 'blue'))
+
+
+
+```
+
+
+***
+
+### Exercise
+Modify the NIMBLE created to fit the general SBM to fit an assortative SBM. 
+
+***
+
+
+***
+
+### Exercise
+ 
+Extract a posterior cluster assignment using the method
+from part 1. Comment on any differences in MCMC diagnostics and
+accuracy.
+
+***
+
+## Refitting with weakly informative prior
+
+# Trade application
+
+
+***
+
+### Exsercise
+
+Fit a stochastic block model with the priors of your choice to the trade data and
+evaluate performance. 
+
+***
+
+***
+
+### Exercise
+
+Recall the basic network logistic regression model: 
+
+$$\text{logit} ((p(y_{ij}= 1)) = \text{logit} (\pi_{ij}) = \beta_0 + \beta_1 x_{ij},$$ where our edge covariate is an indicator that the two countries are in the same region, $x_{ij} = 1(R_i = R_j)$.
+
+How could you modify the SBM model to compare the SBM coefficients to the logistic regression 
+coefficients?
+
+How does the SBM perform relative to the two network logistic regressions? Interpret
+this, addressing: (i) the importance of regional vs latent clustering, 
+(ii) the degree of node heterogeneity.
+
+
+***
+
+
+***
+
+# ASSIGNMENT
+Continue working with your selected data set and analyze it using one of the stochastic
+block models above. If you are unsure about hyperparameter selection, use some prior
+predictive checks to evaluate your choices. Additionally, you might consider varying 
+your priors, particularly the degree of assortativeness and compare the resultant models using some of the accuracy 
+measures presented previously. 
+
+Is there any natural grouping to compare the posterior clustering assignment with? 
+If so, interpret any noteworthy discrepancies.
+
+If your network is large and convergence is poor, there are several options for
+improving performance: experiment with alternative NIMBLE
+samplers, use a package such as `sbm` (uses variational EM), write your own Gibbs 
+sampler (slightly ambitious given the time constraint), 
+or subset the data (just make sure you provide justification for your 
+subsetting scheme).
+***
+
+
