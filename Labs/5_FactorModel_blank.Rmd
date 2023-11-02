@@ -1,0 +1,392 @@
+---
+title: "Latent Factors"
+output: html_document
+date: "2023-10-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, echo = FALSE, message = FALSE}
+## Set directories
+data_path <- 'Data/'
+save_path <- 'Results/'
+
+# Load packages
+library(tidyverse)
+library(here)
+library(igraph)
+library(ggraph)
+library(RColorBrewer)
+library(pheatmap)
+library(nimble)
+library(nimbleHMC)
+library(bayesplot)
+library(mvtnorm)
+library(gridExtra)
+library(pROC)
+library(latex2exp)
+
+# Do we want to save any output?
+save_files <- TRUE
+
+```
+# 1. Simulate from a latent space network model 
+
+To begin, we simulate form the latent space network model with a probit link function, 
+$\Phi^{-1}$, where $\Phi$ is the cumulative distribution function of the standard normal distribution. 
+
+As described in lecture, this model connection propensity between any two nodes to 
+the inner product of their latent features. 
+
+$$p(y_{ij}=1) = \pi_{ij} = \Phi(\alpha + \sum_{h=1}^H \eta_{ih}\eta_{jh})$$
+where 
+
+$$
+\begin{aligned}
+\eta_{ih} &\sim N(0, \tau_h^{-1}) \\
+\tau_h &= \prod_{h = 1}^K \vartheta_h \\
+\vartheta_1 &\sim \text{Ga}(a_1, 1) \\
+\vartheta_h & \sim \text{Ga}(a_2, 1) \quad h = 1, \cdots, K
+\end{aligned}
+$$
+
+Here, $\alpha$ is an intercept controlling the denseness of connections, 
+$\eta_i, \eta_j$ are $H$-dimensional vectors of latent features for nodes $i$ and $j$
+respectively, and $\tau$ is a vector of shrinkage factors controlling the influence
+of each dimension of the latent space. Note that if $a_2 > 1$, $E[\vartheta_k] > 1$ and so 
+$tau_h$ decreases with $h$, providing increasing shrinkage on successive dimensions. 
+
+
+
+## 1a. Visualizing a small network 
+
+We begin by simulating a network with only 10 nodes for ease of visualization.
+
+```{r}
+set.seed(1234)
+
+# Data (and latent space) dimensions
+V <- 10 # Number of vertices
+H <- 10 # Dimension of latent space
+
+# Hyperparameters
+a1 <- 2.5 # Gamma shrinkage parameter for factor 1
+a2 <- 2.5 # Gamma shrinkage parameters for factors 2:H
+
+meanP <- 0.25 # Moderately sparse network
+mu0 <- probit(meanP) # Prior mean for intercept
+sd.mu <- 0.1 # Prior sd for intercept: consider probit scale
+
+# Simulate multiplicative gamma shrinkage process
+U <- rep(NA,H)
+U[1] <- rgamma(1, a1, 1)
+U[2:H] <- rgamma(H-1, a2, 1)
+
+Tau <- rep(NA, H)
+for(h in 1:H){
+  Tau[h] <- prod(U[1:h])
+}
+
+# Simulate latent factors
+X <- matrix(NA, nrow = V, ncol = H)
+for(h in 1:H){
+  X[,h] <- rmvnorm(n = 1, mean = rep(0, V), sigma = diag(Tau[h]^(-1), nrow = V)) 
+}
+
+# Simulate intercept
+mu <- rnorm(1,mean = mu0, sd = sd.mu) # Normal prior for baseline connection score
+
+# Compute the linear predictor and Z latent connection score
+M.Z <- mu + X %*% t(X) 
+P <- phi(M.Z) # Gaussian CDF
+
+# Look at the distribution of connection probabilities
+# hist(c(P))
+# round(quantile(c(P), seq(0,1, 0.1), na.rm = TRUE), 4)
+
+# Sample edges
+Y <- matrix(NA, V,V)
+Y[upper.tri(Y)] <- rbinom(V*(V-1)/2, 1, P[upper.tri(P)])
+Y[lower.tri(Y)] <- t(Y)[lower.tri(Y)]
+
+diag(Y) <- diag(P) <- NA # Makes plotting more clear
+
+rownames(Y) <- colnames(Y) <- rownames(P) <- colnames(P) <- LETTERS[1:V]
+
+p1 <- pheatmap(P, cluster_rows = FALSE, cluster_cols = FALSE, 
+         color=colorRampPalette(brewer.pal(9,"Blues")[c(1,8)])(30), 
+         main = "Probability Matrix")[[4]]
+
+p2 <- pheatmap(Y, cluster_rows = FALSE, cluster_cols = FALSE, 
+         color=colorRampPalette(brewer.pal(9,"Blues")[c(1,8)])(30), 
+         main = "Adjacency Matrix")[[4]]
+
+p3 <- data.frame(LF1 = X[, 1], LF2 = X[,2], id = LETTERS[1:V]) %>% 
+ggplot(aes(x = LF1, y = LF2, label = id)) + 
+  geom_text() + 
+  theme_minimal() + 
+  ggtitle("Latent Space") + 
+  xlim(c(-2, 4) ) + 
+  ylim(c(-2,4)) + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(p1, p2, p3,  nrow = 1)
+
+
+```
+
+The plots above show the relationship between postion in the latent space (R), 
+link connection probability (L), and realized adjacency matrix (C). Note that
+data is simulated from a 10-dimensional latent space and so probabilities will
+not correspond entirely to distances in the first two dimensions. 
+
+## 1b. Exploring a larger network
+
+Next, we simulate a larger network to which we'll fit our latent space model. 
+```{r}
+set.seed(1234)
+
+# All hyperparameters and data structures are as above except:
+V <- 50 # 100 Number of vertices
+H <- 5
+
+# Simulate multiplicative gamma shrinkage process
+U <- rep(NA,H)
+U[1] <- rgamma(1, a1, 1)
+U[2:H] <- rgamma(H-1, a2, 1)
+
+Tau <- rep(NA, H)
+for(h in 1:H){
+  Tau[h] <- prod(U[1:h])
+}
+
+# Simulate latent factors
+X <- matrix(NA, nrow = V, ncol = H)
+for(h in 1:H){
+  X[,h] <- rmvnorm(n = 1, mean = rep(0, V), sigma = diag(Tau[h]^(-1), nrow = V)) 
+}
+
+# Simulate intercept
+mu <- rnorm(1,mean = mu0, sd = sd.mu) # Normal prior for baseline connection score
+
+# Compute the linear predictor and Z latent connection score
+M.Z <- mu + X %*% t(X) 
+P <- phi(M.Z)
+
+# hist(c(P))
+# round(quantile(c(P), seq(0,1, 0.1), na.rm = TRUE), 4)
+
+# Sample edges
+Y <- matrix(NA, V,V)
+Y[upper.tri(Y)] <- rbinom(V*(V-1)/2, 1, P[upper.tri(P)])
+Y[lower.tri(Y)] <- t(Y)[lower.tri(Y)]
+```
+***
+
+### Exercise
+
+Which parameters can you vary? What happens if you change the dimension 
+of the latent space? Modify the hyperparameters of the shrinkage process. 
+How can you produce a more bimodal vs uniform distribution of latent probabilities?
+
+***
+
+
+```{r, echo = FALSE}
+# Define model with BUGS code
+fmCode <- nimbleCode({
+  
+  # Intercept
+  mu ~ dnorm(mu0, sd = sd.mu)
+  
+  # Shrinkage process
+  U[1] ~ dgamma(a1, 1)
+  for(h in 2:H){
+    U[h] ~ dgamma(a2, 1)
+  }
+
+  for(h in 1:H){
+    Tau[h] <- prod(U[1:h])
+  }
+
+  # Latent factors
+  for(h in 1:H){
+    for(v in 1:V){
+      X[v,h] ~ dnorm(M[v] , sd = sqrt(Tau[h]^(-1)))
+    }
+  }
+  
+  # Compute linear predictor
+  M.Z[1:V,1:V] <- mu + X[,] %*% t(X[,]) # Recall multivariate nodes must be used with []
+
+  # Likelihood
+  for (i in 2:V){
+    for (j in 1:(i-1)){ # Self-edges not allowed
+      P[i,j] <- phi(M.Z[i,j]) # Gaussian CDF 
+      P[j,i] <- P[i,j]
+      Y[i,j] ~ dbin(size = 1, prob = P[i,j])
+    }
+  }
+
+})
+
+
+# Define the constants
+diag(Y) <- 0 # diag = NA is useful for plotting only
+mu0 = log(mean(Y)/(1-mean(Y))) # prior mean for Mu is logit(meanY)
+
+fmConsts <- list(V = V,
+                 H = H, 
+                  a1 = a1, a2 = a2,
+                  mu0 = mu0, sd.mu = sd.mu,
+                  M = rep(0, V))
+
+# Define the data
+fmData <- list(Y = Y)
+
+# Set initialization parameters
+fmInits <- list(X = matrix(0, V, H), 
+                U = 1:H,
+                mu = mu0)
+
+fmDims <- list(Tau = H, X = c(V, H), P = c(V,V))
+
+```
+
+Given the complexity of this model, and the fact that required conjugacies are 
+not present in the NIMBLE library, we fit this model using Hamiltonian Monte Carlo. 
+Since this sampler takes longer to run, we include code to save and read-in the 
+model output. Note that in defining our nimbleModel, we now must enable
+derivative capabilities in order to fit using HMC. 
+
+```{r, cache = TRUE}
+
+# Set MCMC args
+nchains <- 2
+niter <- 5000
+nburnin <- 2000
+
+samplesHMC <- nimbleHMC(fmCode, data = fmData, inits = fmInits, constants = fmConsts, 
+          monitors = c("P", "mu", "Tau"), WAIC = TRUE, 
+          niter = niter, nburnin = nburnin, nchains = nchains)
+
+```
+
+Now we evaluate performance. It looks quite good, although the sampler is slow. 
+
+```{r}
+# Extract samples and look at them
+all.samples <- do.call(rbind, samplesHMC$samples) # create dataframe with all chains
+p.HMC <- all.samples[, grepl("P", colnames(all.samples))]
+
+# Latent probability recovery: only possible with simulated data
+p.post.HMC <- matrix(data = colMeans(p.HMC), byrow = FALSE, nrow = V, ncol = V)
+diag(p.post.HMC) <- 0
+
+df <- data.frame(p.post = p.post.HMC[upper.tri(p.post.HMC)], p.true = c(P[upper.tri(P)]), y = Y[upper.tri(Y)] )
+plot.roc(df$y ~ df$p.post, percent = TRUE, print.auc = TRUE, main = "ROC Curve - Factor Model with Simulated Data")
+ggplot(df, aes(x = p.post, y = p.true)) + 
+      geom_point(aes(alpha = I(0.3))) + # replace with geom_jitter if probs v similar
+      geom_abline(intercept = 0, slope = 1, color = "gray") + 
+      xlab(parse(text = TeX('$\\hat{\\pi}_{ij}$'))) + 
+      ylab(parse(text = TeX('$\\pi_{ij}$'))) + 
+      ggtitle("Factor Model Accuracy on Simulated Data") +
+      theme_minimal() + 
+      theme(text = element_text(family = "serif", size = 14))
+  
+
+# Look at mixing
+mu.samples <- matrix(all.samples[, grepl("mu", colnames(all.samples))], nrow(all.samples), 1) 
+colnames(mu.samples) <- c("mu")
+mcmc_trace(as.matrix(mu.samples))
+
+```
+
+# 2. Trade Application
+
+We continue our analysis of the 2021 OECD trade network. We begin with
+the same hyperparameters as above.
+
+First we read the data. 
+
+```{r}
+# Read the data
+A <- read.csv(here::here(paste0(data_path, "2021Trade/A_subset.csv")))
+A <- as.matrix(A)
+features <- read.csv(here::here(paste0(data_path, "2021Trade/Features_subset.csv")))
+```
+*** 
+
+### Exercise
+ 
+Choose an appropriate prior mean $\mu_0$ and relevant constants (e.g. $V$) and fit the latent factor network model above to the trade data and comment on mixing and accuracy. 
+
+***
+
+
+While the performance and speed for our sample data sets is very reasonable, Peter Hoff's `eigenmodel` package provides an efficient and straightforward alternative for larger data sets. This package implements the latent eigenmodel described in the paper "Modeling homophily and stochastic equivalence in symmetric
+relational data" (Hoff, 2018). 
+
+$$P(y_{i,j} = 1) = \Phi(\mu + \beta^T x_{i,j} + \alpha(u_i, u_j))$$
+
+While this model is very similar to the latent space model presented in class, note that here $\alpha(u_i, u_j) = u_i \lambda u_j$, $u_i \in \mathbb{R}^K$ is a vector of latent characteristics for each node, and $\Lambda$ is a $K \times K$ diagonal matrix with real entries. Note that since the entries of $\Lambda$ can be positive or negative, the model can capture both positive homophily, i.e., similar values of $u_{i,k}$ and $u_{j,k}$ can contribute to or subtract from the edge propensity. Additionally, $x_{i,j}$ provides an array of edge covariates - in our trade application, we can let $x_{i,j} = 1(region_i = region_j)$. 
+
+First, we fit the latent eigenmodel without regressors. 
+
+```{r, cache = TRUE}
+library(eigenmodel)
+# Define the model data
+reg <- as.factor(features$region) 
+X = array(outer(reg,reg, FUN = "==")*1, dim = c(V,V,1)) # x_ij = 1(region_i == region_j)
+
+# Without regressors
+fit.eig <- eigenmodel_mcmc(Y = A, S = 5000, burn = 2000)
+
+plot(fit.eig)
+ulu.post <- fit.eig$ULU_postmean
+p.post <- phi(ulu.post)
+```
+
+And now we review performance.
+```{r}
+df <- data.frame(pred = p.post[upper.tri(p.post)], y = A[upper.tri(A)])
+plot.roc(df$y ~ df$pred, percent = TRUE, print.auc = TRUE, main = "ROC Curve - Hoff Model: Trade Application")
+```
+
+Next, we fit the latent eigenmodel with regressors. 
+```{r, cache = TRUE}
+# With regressors
+fit.eig.X <- eigenmodel_mcmc(Y=A, X = X, S = 5000, burn = 2000)
+
+plot(fit.eig.X)
+ulu.post <- fit.eig.X$ULU_postmean
+xb.post <- mean(fit.eig.X$b_postsamp)*X[,,1]
+p.post <- phi(ulu.post + xb.post)
+```
+
+And now we review the performance. 
+```{r}
+df <- data.frame(pred = p.post[upper.tri(p.post)], y = A[upper.tri(A)])
+plot.roc(df$y ~ df$pred, percent = TRUE, print.auc = TRUE, main = "ROC Curve - Hoff Model +: Trade Application")
+
+```
+
+***
+
+# ASSIGNMENT
+
+Continue working with your selected data set and analyze it using either of
+the latent space models presented above and compare its performance to the models 
+that you've previously fit with respect to AUC, WAIC, etc. If using the Nimble model, 
+consider adding degree correction via node random effects, and adding any other 
+covariates that might be relevant. 
+
+***
+
+
+
+
+
