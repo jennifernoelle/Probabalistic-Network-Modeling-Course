@@ -1,0 +1,304 @@
+---
+title: "Latent Factors"
+output: html_document
+date: "2023-10-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, echo = FALSE, message = FALSE}
+## Set directories
+data_path <- 'Data/'
+save_path <- 'Results/'
+
+# Load packages
+library(tidyverse)
+library(here)
+library(igraph)
+library(ggraph)
+library(RColorBrewer)
+library(pheatmap)
+library(nimble)
+library(nimbleHMC)
+library(bayesplot)
+library(mvtnorm)
+library(gridExtra)
+library(latex2exp)
+library(pROC)
+
+# Do we want to save any output?
+save_files <- TRUE
+
+```
+This file provides a simple template for a dynamic latent space model in Nimble in
+the style of Durante and Dunson (2014). The model is fit (slowly, plan to run overnight)
+via HMC. You are encouraged to experiment with alternative samplers and blocking to
+improve efficiency and mixing. 
+
+# PART 1: SIMULATE FROM A LATENT SPACE MODEL 
+
+First, we simulate data from an inner product graph model. Let's begin with only
+10 nodes for ease of visualization
+
+## Visualization
+Here we simulate from a dynamic latent space network model. If you're planning to use
+this on your own data, you should experiment with simulated networks of similar dimension. 
+I find HMC performs poorly compared to the Gibbs sampler (using the logistic link and Polya-Gamma data augmentation)
+for larger networks. 
+
+```{r}
+set.seed(1234)
+
+# Data (and latent space) dimensions
+V <- 10 # Number of vertices
+H <- 10 # Dimension of latent space
+Times <- sort(sample(1:50, 10)) # Vector of points in time, worked with 10 times
+R <- length(Times)
+V.names <- paste0("Node ", 1:V)
+T.names <- paste0("Time ", Times)
+
+# Hyperparameters
+a1 <- 2.5 # Gamma shrinkage parameter for factor 1
+a2 <- 2.5 # Gamma shrinkage parameters for factors 2:H
+K_x <- K_mu <- 0.01 # GP covar parameters
+
+meanP <- 0.25 # Moderately sparse network
+mu0 <- probit(meanP) # Prior mean for intercept
+sd.mu <- 0.1 # Prior sd for intercept: consider probit scale INCORPORATE THIS INTO KMU
+
+# Simulate multiplicative gamma shrinkage process
+U <- rep(NA,H)
+U[1] <- rgamma(1, a1, 1)
+U[2:H] <- rgamma(H-1, a2, 1)
+
+Tau <- rep(NA, H)
+for(h in 1:H){
+  Tau[h] <- prod(U[1:h])
+}
+
+### Simulate latent factors
+
+# X(t) process covariance
+D <- as.matrix(dist(Times, diag = TRUE, upper = TRUE), nrow = R)
+C_X <- exp(-K_x*D^2)
+```
+
+At this point, we can look at the induced covariance matrix; this is a useful step 
+for evaluating how quickly correlation decays with a given choice of hyperparameters. 
+As you might expect, the model performs better when there is greater autocorrelation
+between network observations. Intuitively: when the latent factors are more similar between 
+periods it's easier for the model to learn the latent factors in any given time period. 
+
+```{r}
+# Look at induced covariance 
+rownames(C_X) <- colnames(C_X) <- Times
+pheatmap(C_X, cluster_rows = FALSE, cluster_cols = FALSE)
+```
+
+Next, we simulate the latent factors and the edges. 
+
+```{r}
+# X storage
+X <- array(NA, dim = c(V,H,R))
+X <- provideDimnames(X , sep = "_", base = list("Node", "Factor", "Time"))
+
+# Simulate from GP
+for(h in 1:H){
+  for(v in 1:V){
+      X[v,h,] <- mvtnorm::rmvnorm(n = 1, mean = rep(0, R), sigma = Tau[h]^(-1)*C_X) 
+    }
+  }
+
+# Simulate intercept
+C_mu <- exp(-K_mu*D^2)
+mu <- matrix(mvtnorm::rmvnorm(n=1,mean= rep(mu0, R), sigma = C_mu), nrow = R, ncol = 1)
+
+# Compute linear predictor and connection probabilities
+S <- array(NA, dim = c(V,V,R))
+for(t in 1:R){
+      S[,,t] <- mu[t] + X[,,t] %*% t(X[,,t])
+      diag(S[,,t]) <- NA
+}  
+
+P <- phi(S)
+dimnames(P) <- list(V.names, V.names, T.names )
+
+# Look at the distribution of connection probabilities
+hist(c(P))
+round(quantile(c(P), seq(0,1, 0.1), na.rm = TRUE), 4)
+
+### Sample edges
+Y <- array(NA, dim = c(V,V,R))
+dimnames(Y) <- list(V.names, V.names, T.names )
+
+# Using loop for clarity not efficiency
+for(r in 1:R){
+  for(i in 2:V){
+    for(j in 1:(i-1)){
+      Y[i,j,r] <- Y[j,i,r] <- rbinom(1,1,prob = P[i,j,r])
+    }
+  }
+}
+```
+Since we now have 3-dimensional data, one basic visualization is to look at the edges involving
+a fixed node $i$ over time. 
+
+```{r}
+### Visualization: start with a random vertex
+v <- sample(1:V, 1)
+p1 <- pheatmap(P[v,,], cluster_rows = FALSE, cluster_cols = FALSE, 
+         color=colorRampPalette(brewer.pal(9,"Blues")[c(1,8)])(30), 
+         main = paste0("Probability Matrix: V = ", v))[[4]]
+
+p2 <- pheatmap(Y[v,,], cluster_rows = FALSE, cluster_cols = FALSE, 
+         color=colorRampPalette(brewer.pal(9,"Blues")[c(1,8)])(30), 
+         main = paste0("Adjacency Matrix: V = ", v))[[4]]
+
+grid.arrange(p1, p2, nrow = 1)
+
+
+```
+
+# PART 2: NIMBLE MODEL 
+
+## Nimble code
+Next, we define a Nimble model. You might want to add a deterministic node for log likelihood. 
+
+```{r, echo = FALSE}
+# Define model with BUGS code
+DfmCode <- nimbleCode({
+  
+  # Intercept
+  mu[1:R] ~ dmnorm(mu0[1:R], cov = C_mu[1:R, 1:R])
+  
+  # Shrinkage process
+  U[1] ~ dgamma(a1, 1)
+  for(h in 2:H){
+    U[h] ~ dgamma(a2, 1)
+  }
+
+  for(h in 1:H){
+    Tau[h] <- prod(U[1:h])
+  }
+
+  # Latent factors
+  for(h in 1:H){
+      mvCov[1:R, 1:R, h] <- Tau[h]^(-1)*C_X[,] # Array construction to avoid multiply-defined nodes on LHS
+    for(v in 1:V){
+        X[v,h,] ~ dmnorm(mean = muX[], cov = mvCov[1:R, 1:R, h]) # no expressions in mvt densities
+      }
+    }
+
+  # Compute linear predictor and connection probabilities
+  for(t in 1:R){
+        P[1:V,1:V,t] <- phi(mu[t] + X[,,t] %*% t(X[,,t]))
+  }
+  
+  # Likelihood
+  for(t in 1:R){
+    for(i in 2:V){
+      for(j in 1:(i-1)){
+        Y[i,j,t] ~ dbin(size = 1, prob = P[i,j,t])
+      }
+    }
+  }
+
+})
+
+
+# Define the constants
+mu0 = log(mean(Y, na.rm = TRUE)/(1-mean(Y, na.rm = TRUE))) # prior mean for Mu is logit(meanY)
+for(v in 1:v){
+  Y[v,v,] <- 0
+}
+
+DfmConsts <- list(V = V,
+                 H = H, 
+                 R = R,
+                 a1 = a1, a2 = a2,
+                 mu0 = rep(mu0, R), 
+                 C_mu = C_mu, C_X = C_X, # Providing GP parameters as constants
+                 muX = rep(0,R))
+
+# Define the data
+DfmData <- list(Y = Y)
+
+# Set initialization parameters
+DfmInits <- list(X =array(0, dim = c(V,H,R)), 
+                U = 1:H,
+                mu = rep(mu0, R)) # , array.logL = array(NA, dim = c(V,V,R))
+
+DfmDims <- list(Tau = H, X = c(V, H, R), P = c(V,V,R), mvCov = c(R,R,H)) 
+
+# Set MCMC args
+nchains <- 2
+niter <- 5000
+nburnin <- 2000
+
+# Set up saving information
+file_path <- here::here(paste0(save_path, "DfmHMC_probit_sim.rds"))
+```
+
+## Fit via HMC
+This model will take a bit longer to run (about 2 hours on my machine for the small simulation), so we save the results to a file. 
+You can change `eval` to `TRUE` to evaluate this chunk while knitting, however it's strong recommended that you instead
+run in interactive mode, save the results, and then read the results file in when knitting. If you do this, make sure to create a Results folder first.
+
+```{r, eval = FALSE}
+
+start.time <- Sys.time()
+samplesHMC <- nimbleHMC(DfmCode, data = DfmData, inits = DfmInits, constants = DfmConsts, 
+          monitors = c("P", "mu", "Tau"), WAIC = TRUE, 
+          niter = niter, nburnin = nburnin, nchains = nchains)
+Sys.time() - start.time
+
+if(save_files){saveRDS(object = samplesHMC, file = file_path)}
+
+
+```
+ Now let's take a look at performance. Note that the code below includes some book-keeping needed to discard the redundant entries in the symmetric matrices
+ forming the network and probability arrays. 
+
+```{r}
+# Read in the results
+samplesHMC <- readRDS(file_path)
+
+# Extract samples
+all.samples <- do.call(rbind, samplesHMC$samples) # create dataframe with all chains
+p.HMC <- all.samples[, grepl("P", colnames(all.samples))]
+
+# Vectorize the matrices, discarding the lower triangle due to symmetry
+ppost.array <- array(colMeans(p.HMC), dim = c(V,V,R))
+ppost.vec <- p.true.vec <- y.vec <- c()
+this.y <- this.y <- matrix(NA, V,V)
+for(t in 1:dim(Y)[3]){ # Extract vectorized version based on only upper.tri b/c symmetric
+  this.y <- Y[,,t]
+  this.ppost <- ppost.array[,,t]
+  this.p <- P[,,t]
+  
+  ppost.vec <- c(ppost.vec, this.ppost[upper.tri(this.ppost)])
+  p.true.vec <- c(p.true.vec, this.p[upper.tri(this.p)])
+  y.vec <- c(y.vec, this.y[upper.tri(this.y)])
+}
+
+df <- data.frame(p.post =ppost.vec, p.true = p.true.vec, y = y.vec)
+
+# Latent probability recovery: only possible with simulated data
+ggplot(df, aes(x = p.post, y = p.true)) + 
+      geom_point(aes(alpha = I(0.3))) + # replace with geom_jitter if probs v similar
+      geom_abline(intercept = 0, slope = 1, color = "gray") + 
+      xlab(parse(text = TeX('$\\hat{\\pi}_{ij}$'))) + 
+      ylab(parse(text = TeX('$\\pi_{ij}$'))) + 
+      ggtitle("Factor Model Accuracy on Simulated Data") +
+      theme_minimal() + 
+      theme(text = element_text(family = "serif", size = 14))
+
+# Accuracy via AUC-ROC
+plot.roc(df$y ~ df$p.post, percent = TRUE, print.auc = TRUE, main = "ROC Curve - Dynamic Factor Model with Simulated Data")
+
+# MCMC diagnostics: mixing
+mcmc_trace(samplesHMC$samples, regex_pars = c("mu"))
+```
